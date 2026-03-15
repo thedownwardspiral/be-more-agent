@@ -26,6 +26,23 @@ This project turns a Raspberry Pi into a fully functional, conversational AI age
 * LCD Screen (official 7" DSI touchscreen recommended — 800x480 native resolution)
 * Raspberry Pi Camera Module
 
+## 🖥️ Display Requirements
+
+**A desktop environment (X11/Wayland) must be running on the Pi.** The agent uses tkinter for its GUI, which requires a display server. A headless/server-only Raspberry Pi OS installation will not work — you will get a `couldn't connect to display ":0"` error.
+
+**Recommended:** Use Raspberry Pi OS with Desktop and configure it for desktop autologin:
+```bash
+sudo raspi-config
+# Navigate to: System Options → Boot / Auto Login → Desktop Autologin
+```
+
+If you installed Raspberry Pi OS Lite (no desktop), you'll need to install a display manager first:
+```bash
+sudo apt install -y lightdm
+sudo raspi-config
+# Then select Desktop Autologin as above, and reboot
+```
+
 ---
 
 ## 📂 Project Structure
@@ -65,7 +82,7 @@ be-more-agent/
 ## 🚀 Installation
 
 ### 1. Prerequisites
-Ensure your Raspberry Pi OS is up to date.
+Ensure your Raspberry Pi OS is up to date and has a desktop environment (see [Display Requirements](#️-display-requirements) above).
 ```bash
 sudo apt update && sudo apt upgrade -y
 sudo apt install git -y
@@ -153,7 +170,7 @@ This software is a generic framework. You can give it a new personality by repla
 
 ## ⚠️ Troubleshooting
 
-* **"no display name" error:** The script defaults to `DISPLAY=:0` for the DSI touchscreen. If running over SSH, ensure an X session is active on the Pi (e.g., desktop is booted). You can also override with `DISPLAY=:1 python agent.py` if needed.
+* **`couldn't connect to display ":0"` error:** The Pi must be running a desktop environment (X11 or Wayland). If you installed Raspberry Pi OS Lite (server/headless), you need to install `lightdm` and configure desktop autologin via `sudo raspi-config` — see [Display Requirements](#️-display-requirements). If running over SSH, ensure the desktop is already active on the Pi. You can override the target display with `DISPLAY=:1 python agent.py` if needed.
 * **"No search library found":** If web search fails, ensure you are in the virtual environment and `duckduckgo-search` is installed via pip.
 * **llama-swap not running:** Check the service status with `sudo systemctl status llama-swap`. View logs with `journalctl -u llama-swap -f`.
 * **Shutdown Errors:** When you exit the script (Ctrl+C), you might see `Expression 'alsa_snd_pcm_mmap_begin' failed`. **This is normal.** It just means the audio stream was cut off mid-sample. It does not affect the functionality.

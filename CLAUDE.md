@@ -70,6 +70,8 @@ The Python code communicates with this stack using the `openai` Python package, 
 
 ## Display
 
+**A desktop environment (X11/Wayland) is required.** The agent uses tkinter for its GUI, which needs a running display server. A headless/server-only Pi OS installation will fail with `couldn't connect to display ":0"`. If using Pi OS Lite, install `lightdm` and configure desktop autologin via `raspi-config`.
+
 The target display is the Raspberry Pi's DSI touchscreen interface (800x480). The script sets `os.environ.setdefault("DISPLAY", ":0")` at the top of `agent.py` before any tkinter imports, ensuring the GUI renders to the DSI screen regardless of launch context (local terminal, SSH, or systemd service). Users can override by setting `DISPLAY` before running.
 
 ## Audio Handling
