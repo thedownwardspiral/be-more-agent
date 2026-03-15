@@ -443,7 +443,7 @@ class BotGUI:
     def safe_main_execution(self):
         try:
             self.warm_up_logic()
-            self.tts_active.set()
+            self.tts_active.clear()
             self.tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
             self.tts_thread.start()
             
@@ -715,6 +715,12 @@ class BotGUI:
                     if clean_sentence and re.search(r'[a-zA-Z0-9]', clean_sentence):
                         with self.tts_queue_lock: self.tts_queue.append(clean_sentence)
                     sentence_buffer = ""
+
+            if not is_action_mode and sentence_buffer.strip():
+                clean_sentence = sentence_buffer.strip()
+                if re.search(r'[a-zA-Z0-9]', clean_sentence):
+                    with self.tts_queue_lock: self.tts_queue.append(clean_sentence)
+                sentence_buffer = ""
 
             if is_action_mode:
                 action_data = self.extract_json_from_text(full_response_buffer)
