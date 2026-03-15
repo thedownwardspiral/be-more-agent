@@ -49,10 +49,10 @@ cd ..
 # 5. Install Python Libraries
 echo -e "${YELLOW}[5/6] Installing Python Libraries...${NC}"
 # Check if venv exists, if not create it
-if [ ! -d "venv" ]; then
-    python3 -m venv venv
+if [ ! -d ".bmo" ]; then
+    python3 -m venv .bmo
 fi
-source venv/bin/activate
+source .bmo/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
@@ -113,4 +113,4 @@ if [ ! -f "wakeword.onnx" ]; then
     curl -L -o wakeword.onnx https://github.com/dscripka/openWakeWord/raw/main/openwakeword/resources/models/hey_jarvis_v0.1.onnx
 fi
 
-echo -e "${GREEN}✨ Setup Complete! Run 'source venv/bin/activate' then 'python agent.py'${NC}"
+echo -e "${GREEN}✨ Setup Complete! Run 'source .bmo/bin/activate' then 'python agent.py'${NC}"
