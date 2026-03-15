@@ -56,14 +56,56 @@ source venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# 6. Pull AI Models
-echo -e "${YELLOW}[6/6] Checking AI Models...${NC}"
-if command -v ollama &> /dev/null; then
-    ollama pull gemma3:1b
-    ollama pull moondream
-else
-    echo -e "${RED}❌ Ollama not found. Please install it manually.${NC}"
+# 6. Build llama.cpp
+echo -e "${YELLOW}[6/9] Building llama.cpp...${NC}"
+if [ ! -d "llama.cpp" ]; then
+    git clone https://github.com/ggml-org/llama.cpp.git
 fi
+cd llama.cpp
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release -j$(nproc)
+cd ..
+
+# 7. Download GGUF models
+echo -e "${YELLOW}[7/9] Downloading Qwen3.5-4B model files...${NC}"
+mkdir -p models
+pip install huggingface-hub
+if [ ! -f "models/Qwen3.5-4B-Q4_K_M.gguf" ]; then
+    huggingface-cli download unsloth/Qwen3.5-4B-GGUF Qwen3.5-4B-Q4_K_M.gguf --local-dir models
+fi
+if [ ! -f "models/mmproj-F16.gguf" ]; then
+    huggingface-cli download unsloth/Qwen3.5-4B-GGUF mmproj-F16.gguf --local-dir models
+fi
+
+# 8. Install llama-swap
+echo -e "${YELLOW}[8/9] Installing llama-swap...${NC}"
+if [ ! -f "llama-swap" ]; then
+    ARCH=$(uname -m)
+    if [ "$ARCH" == "aarch64" ]; then
+        SWAP_URL=$(curl -s https://api.github.com/repos/mostlygeek/llama-swap/releases/latest \
+            | grep "browser_download_url.*linux_arm64" \
+            | head -1 | cut -d '"' -f 4)
+    else
+        SWAP_URL=$(curl -s https://api.github.com/repos/mostlygeek/llama-swap/releases/latest \
+            | grep "browser_download_url.*linux_amd64" \
+            | head -1 | cut -d '"' -f 4)
+    fi
+    if [ -n "$SWAP_URL" ]; then
+        curl -L -o llama-swap.tar.gz "$SWAP_URL"
+        tar -xvf llama-swap.tar.gz llama-swap
+        rm llama-swap.tar.gz
+        chmod +x llama-swap
+    else
+        echo -e "${RED}❌ Could not find llama-swap release. Install manually from https://github.com/mostlygeek/llama-swap/releases${NC}"
+    fi
+fi
+
+# 9. Install llama-swap systemd service
+echo -e "${YELLOW}[9/9] Setting up llama-swap service...${NC}"
+sudo cp llama-swap.service /etc/systemd/system/llama-swap.service
+sudo systemctl daemon-reload
+sudo systemctl enable llama-swap
+sudo systemctl start llama-swap
 
 # 7. OpenWakeWord Model (Added this back so the user has a default)
 if [ ! -f "wakeword.onnx" ]; then

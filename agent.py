@@ -41,7 +41,8 @@ import scipy.signal
 # --- AI ENGINES ---
 import openwakeword
 from openwakeword.model import Model
-import ollama 
+from openai import OpenAI
+import base64
 
 # --- WEB SEARCH (Using your working import) ---
 from ddgs import DDGS 
@@ -60,22 +61,17 @@ WAKE_WORD_THRESHOLD = 0.5
 INPUT_DEVICE_NAME = None 
 
 DEFAULT_CONFIG = {
-    "text_model": "gemma3:1b",
-    "vision_model": "moondream",
+    "text_model": "qwen3.5-4b",
     "voice_model": "piper/en_GB-semaine-medium.onnx",
     "chat_memory": True,
     "camera_rotation": 0,
-    "system_prompt_extras": ""
+    "system_prompt_extras": "",
+    "llm_base_url": "http://localhost:8080/v1"
 }
 
 # LLM SETTINGS
-OLLAMA_OPTIONS = {
-    'keep_alive': '-1',     
-    'num_thread': 4,
-    'temperature': 0.7,     
-    'top_k': 40,
-    'top_p': 0.9
-}
+LLM_TEMPERATURE = 0.7
+LLM_TOP_P = 0.9
 
 def load_config():
     config = DEFAULT_CONFIG.copy()
@@ -90,7 +86,12 @@ def load_config():
 
 CURRENT_CONFIG = load_config()
 TEXT_MODEL = CURRENT_CONFIG["text_model"]
-VISION_MODEL = CURRENT_CONFIG["vision_model"]
+
+# OpenAI-compatible client pointing at llama-swap
+llm_client = OpenAI(
+    base_url=CURRENT_CONFIG.get("llm_base_url", "http://localhost:8080/v1"),
+    api_key="not-needed"
+)
 
 class BotStates:
     IDLE = "idle"             
@@ -239,10 +240,6 @@ class BotGUI:
         
         self.save_chat_history()
         
-        try:
-            ollama.generate(model=TEXT_MODEL, prompt="", keep_alive=0)
-        except: pass
-
         self.master.quit()
         sys.exit(0) 
         
@@ -483,9 +480,10 @@ class BotGUI:
     def warm_up_logic(self):
         self.set_state(BotStates.WARMUP, "Warming up brains...")
         try:
-            ollama.generate(model=TEXT_MODEL, prompt="", keep_alive=-1)
+            llm_client.models.list()
+            print(f"llama-swap is reachable.", flush=True)
         except Exception as e:
-            print(f"Failed to load {TEXT_MODEL}: {e}", flush=True)
+            print(f"Failed to reach llama-swap: {e}", flush=True)
         self.play_sound(self.get_random_sound(greeting_sounds_dir))
         print("Models loaded.", flush=True)
 
@@ -660,12 +658,16 @@ class BotGUI:
             self.set_state(BotStates.IDLE, "Memory Wiped")
             return
 
-        model_to_use = VISION_MODEL if img_path else TEXT_MODEL
         self.set_state(BotStates.THINKING, "Thinking...", cam_path=img_path)
-        
+
         messages = []
         if img_path:
-            messages = [{"role": "user", "content": text, "images": [img_path]}]
+            with open(img_path, "rb") as f:
+                img_b64 = base64.b64encode(f.read()).decode("utf-8")
+            messages = [{"role": "user", "content": [
+                {"type": "text", "text": text},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+            ]}]
         else:
             user_msg = {"role": "user", "content": text}
             messages = self.permanent_memory + self.session_memory + [user_msg]
@@ -677,13 +679,18 @@ class BotGUI:
         sentence_buffer = "" 
         
         try:
-            stream = ollama.chat(model=model_to_use, messages=messages, stream=True, options=OLLAMA_OPTIONS)
-            
+            stream = llm_client.chat.completions.create(
+                model=TEXT_MODEL, messages=messages, stream=True,
+                temperature=LLM_TEMPERATURE, top_p=LLM_TOP_P
+            )
+
             is_action_mode = False
-            
+
             for chunk in stream:
-                if self.interrupted.is_set(): break 
-                content = chunk['message']['content']
+                if self.interrupted.is_set(): break
+                delta = chunk.choices[0].delta if chunk.choices else None
+                content = delta.content if delta and delta.content else ""
+                if not content: continue
                 full_response_buffer += content
                 
                 if '{"' in content or "action:" in content.lower():
@@ -763,8 +770,11 @@ class BotGUI:
                         self.set_state(BotStates.THINKING, "Reading...")
                         self.thinking_sound_active.set()
                         
-                        final_resp = ollama.chat(model=model_to_use, messages=summary_prompt, stream=False, options=OLLAMA_OPTIONS)
-                        final_text = final_resp['message']['content']
+                        final_resp = llm_client.chat.completions.create(
+                            model=TEXT_MODEL, messages=summary_prompt, stream=False,
+                            temperature=LLM_TEMPERATURE, top_p=LLM_TOP_P
+                        )
+                        final_text = final_resp.choices[0].message.content
                         
                         self.thinking_sound_active.clear()
                         self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)

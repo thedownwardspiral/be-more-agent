@@ -7,6 +7,8 @@ __pycache__/
 env/
 venv/
 .env
+.bmo
+.venv
 
 # --- Large Models & Binaries (Auto-downloaded) ---
 # Ignore the Piper TTS folder (it's huge and OS-specific)
@@ -16,6 +18,16 @@ piper/
 *.onnx
 *.bin
 *.tflite
+*.gguf
+
+# llama.cpp build
+llama.cpp/
+
+# GGUF model files
+models/
+
+# llama-swap binary
+llama-swap
 
 # Exception: Un-comment the line below if you WANT to share your custom wake word
 # !wakeword.onnx

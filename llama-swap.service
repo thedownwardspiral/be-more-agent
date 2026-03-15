@@ -1,0 +1,14 @@
+[Unit]
+Description=llama-swap LLM proxy
+After=network.target
+
+[Service]
+Type=simple
+User=latte
+WorkingDirectory=/home/latte/be-more-agent
+ExecStart=/home/latte/be-more-agent/llama-swap --config /home/latte/be-more-agent/config.yaml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

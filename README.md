@@ -11,13 +11,13 @@ This project turns a Raspberry Pi into a fully functional, conversational AI age
 
 ## ✨ Features
 
-* **100% Local Intelligence**: Powered by **Ollama** (LLM) and **Whisper.cpp** (Speech-to-Text). No API fees, no cloud data usage.
+* **100% Local Intelligence**: Powered by **llama.cpp** + **llama-swap** (LLM) and **Whisper.cpp** (Speech-to-Text). No API fees, no cloud data usage.
+* **Unified Vision & Text**: Uses **Qwen3.5-4B** for both conversation and image understanding — one model does it all.
 * **Open Source Wake Word**: Wakes up to your custom model using **OpenWakeWord** (Offline & Free). No access keys required.
 * **Hardware-Aware Audio**: Automatically detects your microphone's sample rate and resamples audio on the fly to prevent ALSA errors.
 * **Smart Web Search**: Uses DuckDuckGo to find real-time news and information when the LLM doesn't know the answer.
 * **Reactive Faces**: The GUI updates the character's face based on its state (Listening, Thinking, Speaking, Idle).
 * **Fast Text-to-Speech**: Uses **Piper TTS** for low-latency, high-quality voice generation on the Pi.
-* **Vision Capable**: Can "see" and describe the world using a connected camera and the **Moondream** vision model.
 
 ## 🛠️ Hardware Requirements
 
@@ -34,10 +34,16 @@ This project turns a Raspberry Pi into a fully functional, conversational AI age
 be-more-agent/
 ├── agent.py                   # The main brain script
 ├── setup.sh                   # Auto-installer script
+├── config.json                # User settings (Model, Prompt, Hardware)
+├── config.yaml                # llama-swap configuration
+├── llama-swap.service         # systemd service for llama-swap
 ├── wakeword.onnx              # OpenWakeWord model (The "Ear")
-├── config.json                # User settings (Models, Prompt, Hardware)
-├── chat_memory.json           # Conversation history
+├── memory.json                # Conversation history
 ├── requirements.txt           # Python dependencies
+├── llama.cpp/                 # LLM inference engine (built from source)
+├── models/                    # GGUF model files
+│   ├── Qwen3.5-4B-Q4_K_M.gguf  # Text + Vision model
+│   └── mmproj-F16.gguf          # Vision projector
 ├── whisper.cpp/               # Speech-to-Text engine
 ├── piper/                     # Piper TTS engine & voice models
 ├── sounds/                    # Sound effects folder
@@ -65,33 +71,22 @@ sudo apt update && sudo apt upgrade -y
 sudo apt install git -y
 ```
 
-### 2. Install Ollama
-This agent relies on [Ollama](https://ollama.com) to run the brain.
-```bash
-curl -fsSL https://ollama.com/install.sh| sh
-```
-*Pull the required models:*
-```bash
-ollama pull gemma:2b
-ollama pull moondream
-```
-
-### 3. Clone & Setup
+### 2. Clone & Setup
 ```bash
 git clone https://github.com/brenpoly/be-more-agent.git
 cd be-more-agent
 chmod +x setup.sh
 ./setup.sh
 ```
-*The setup script will install system libraries, create necessary folders, download Piper TTS, and set up the Python virtual environment.*
+*The setup script will install system libraries, create necessary folders, download Piper TTS, build llama.cpp from source, download the Qwen3.5-4B model files, install llama-swap, enable it as a systemd service, and set up the Python virtual environment.*
 
-### 4. Configure the Wake Word
+### 3. Configure the Wake Word
 The setup script downloads a default wake word ("Hey Jarvis"). To use your own:
 1. Train a model at [OpenWakeWord](https://github.com/dscripka/openWakeWord).
 2. Place the `.onnx` file in the root folder.
 3. Rename it to `wakeword.onnx`.
 
-### 5. Run the Agent
+### 4. Run the Agent
 ```bash
 source venv/bin/activate
 python agent.py
@@ -99,20 +94,49 @@ python agent.py
 
 ---
 
-## 📂 Configuration (`config.json`)
+## 📂 Configuration
 
-You can modify the hardware behavior and personality in `config.json`. The `agent.py` script creates this on the first run if it doesn't exist, but you can create it manually:
+### `config.json` — Agent Settings
+
+You can modify the hardware behavior and personality in `config.json`:
 
 ```json
 {
-    "text_model": "gemma3:1b",
-    "vision_model": "moondream",
+    "text_model": "qwen3.5-4b",
     "voice_model": "piper/en_GB-semaine-medium.onnx",
     "chat_memory": true,
     "camera_rotation": 0,
     "system_prompt_extras": "You are a helpful robot assistant. Keep responses short and cute."
 }
 ```
+
+| Key | Description |
+|-----|-------------|
+| `text_model` | Model name (must match a model ID in `config.yaml`) |
+| `voice_model` | Path to Piper TTS voice `.onnx` file |
+| `chat_memory` | Enable/disable persistent chat history |
+| `camera_rotation` | Rotate camera image (0, 90, 180, 270) |
+| `system_prompt_extras` | Extra personality instructions appended to the system prompt |
+| `llm_base_url` | Override the LLM API endpoint (default: `http://localhost:8080/v1`) |
+
+### `config.yaml` — llama-swap / LLM Server Settings
+
+Controls how llama-swap launches llama-server for each model:
+
+```yaml
+models:
+  "qwen3.5-4b":
+    cmd: |
+      ./llama.cpp/build/bin/llama-server \
+        --port ${PORT} \
+        -m models/Qwen3.5-4B-Q4_K_M.gguf \
+        --mmproj models/mmproj-F16.gguf \
+        --ctx-size 8192 \
+        --chat-template-kwargs '{"enable_thinking":false}'
+    ttl: 3600
+```
+
+See the [llama-swap documentation](https://github.com/mostlygeek/llama-swap) for advanced configuration options.
 
 ---
 
@@ -128,6 +152,7 @@ This software is a generic framework. You can give it a new personality by repla
 ## ⚠️ Troubleshooting
 
 * **"No search library found":** If web search fails, ensure you are in the virtual environment and `duckduckgo-search` is installed via pip.
+* **llama-swap not running:** Check the service status with `sudo systemctl status llama-swap`. View logs with `journalctl -u llama-swap -f`.
 * **Shutdown Errors:** When you exit the script (Ctrl+C), you might see `Expression 'alsa_snd_pcm_mmap_begin' failed`. **This is normal.** It just means the audio stream was cut off mid-sample. It does not affect the functionality.
 * **Audio Glitches:** If the voice sounds fast or slow, the script attempts to auto-detect sample rates. Ensure your `config.json` points to a valid `.onnx` voice model in the `piper/` folder.
 

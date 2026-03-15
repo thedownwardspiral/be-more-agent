@@ -1,0 +1,10 @@
+models:
+  "qwen3.5-4b":
+    cmd: |
+      ./llama.cpp/build/bin/llama-server \
+        --port ${PORT} \
+        -m models/Qwen3.5-4B-Q4_K_M.gguf \
+        --mmproj models/mmproj-F16.gguf \
+        --ctx-size 8192 \
+        --chat-template-kwargs '{"enable_thinking":false}'
+    ttl: 3600
