@@ -11,13 +11,15 @@
 #  This project is a generic framework and includes no copyrighted assets.
 # =========================================================================
 
+import os
+os.environ.setdefault("DISPLAY", ":0")
+
 import tkinter as tk
 from tkinter import ttk
 from PIL import Image, ImageTk
 import threading
 import time
 import json
-import os
 import subprocess
 import random
 import re
@@ -45,7 +47,7 @@ from openai import OpenAI
 import base64
 
 # --- WEB SEARCH (Using your working import) ---
-from ddgs import DDGS 
+from duckduckgo_search import DDGS
 
 # =========================================================================
 # 1. CONFIGURATION & CONSTANTS

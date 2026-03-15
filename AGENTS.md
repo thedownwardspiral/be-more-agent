@@ -12,7 +12,7 @@ Be More Agent is a single-file Python application (`agent.py`) that turns a Rasp
 # Setup (builds llama.cpp, downloads models, installs deps, enables llama-swap service)
 chmod +x setup.sh && ./setup.sh
 
-# Run
+# Run (auto-targets DSI display via DISPLAY=:0)
 source venv/bin/activate && python agent.py
 ```
 
@@ -47,7 +47,7 @@ agent.py  →  OpenAI Python client  →  llama-swap (:8080)  →  llama-server 
 The entire app is one class, `BotGUI`, with these sections marked by comment banners:
 
 1. **Configuration & Constants** — `config.json` loading, `DEFAULT_CONFIG`, LLM client setup, system prompt, `BotStates` enum
-2. **GUI Class** — tkinter fullscreen app (800x480), PNG face animations from `faces/[state]/`
+2. **GUI Class** — tkinter fullscreen app (800x480, targets DSI display via `DISPLAY=:0`), PNG face animations from `faces/[state]/`
 3. **Action Router** (`execute_action_and_get_result`) — JSON action parsing, three tools: `get_time`, `search_web`, `capture_image`
 4. **Core Logic** (`safe_main_execution`) — Main loop: wake word/PTT → record → transcribe → chat → speak
 5. **Chat & Respond** (`chat_and_respond`) — Streaming LLM calls, action mode vs chat mode detection, vision via base64 images
@@ -97,6 +97,10 @@ Defines model → llama-server command mapping. The `${PORT}` macro is auto-assi
 | whisper.cpp | `./whisper.cpp/build/bin/whisper-cli` | Manual / `setup.sh` |
 | Piper TTS | `./piper/piper` | `setup.sh` |
 | OpenWakeWord | `wakeword.onnx` | `setup.sh` |
+
+## Display
+
+The GUI targets the Raspberry Pi's DSI touchscreen (800x480). `agent.py` sets `os.environ.setdefault("DISPLAY", ":0")` before importing tkinter, so it works from SSH or systemd without extra config. Override by setting `DISPLAY` before launching.
 
 ## Common Tasks
 

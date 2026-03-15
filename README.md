@@ -23,7 +23,7 @@ This project turns a Raspberry Pi into a fully functional, conversational AI age
 
 * **Raspberry Pi 5** (Recommended) or Pi 4 (4GB RAM minimum)
 * USB Microphone & Speaker
-* LCD Screen (DSI or HDMI)
+* LCD Screen (official 7" DSI touchscreen recommended — 800x480 native resolution)
 * Raspberry Pi Camera Module
 
 ---
@@ -92,6 +92,8 @@ source venv/bin/activate
 python agent.py
 ```
 
+The GUI is designed for the Raspberry Pi's DSI display interface (800x480). The script automatically sets `DISPLAY=:0` so it renders to the DSI screen even when launched via SSH or a systemd service. If you need to target a different display, set the `DISPLAY` environment variable before launching.
+
 ---
 
 ## 📂 Configuration
@@ -151,6 +153,7 @@ This software is a generic framework. You can give it a new personality by repla
 
 ## ⚠️ Troubleshooting
 
+* **"no display name" error:** The script defaults to `DISPLAY=:0` for the DSI touchscreen. If running over SSH, ensure an X session is active on the Pi (e.g., desktop is booted). You can also override with `DISPLAY=:1 python agent.py` if needed.
 * **"No search library found":** If web search fails, ensure you are in the virtual environment and `duckduckgo-search` is installed via pip.
 * **llama-swap not running:** Check the service status with `sudo systemctl status llama-swap`. View logs with `journalctl -u llama-swap -f`.
 * **Shutdown Errors:** When you exit the script (Ctrl+C), you might see `Expression 'alsa_snd_pcm_mmap_begin' failed`. **This is normal.** It just means the audio stream was cut off mid-sample. It does not affect the functionality.

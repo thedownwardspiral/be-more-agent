@@ -16,7 +16,7 @@ chmod +x setup.sh
 # Ensure llama-swap service is running
 sudo systemctl status llama-swap
 
-# Run the agent
+# Run the agent (auto-targets DSI display via DISPLAY=:0)
 source venv/bin/activate
 python agent.py
 ```
@@ -31,7 +31,7 @@ Everything lives in `agent.py` — a single ~920-line script with one main class
 
 1. **Configuration & Constants** (top of file) — Loads `config.json`, defines `BotStates` enum, LLM settings, and the system prompt that instructs the LLM to output JSON for tool actions vs plain text for chat. Creates an OpenAI-compatible client (`llm_client`) pointing at llama-swap.
 
-2. **GUI Class** — Fullscreen tkinter app (800x480, designed for Pi LCD). Loads PNG animation sequences from `faces/[state]/` directories. Face state changes based on bot state (idle, listening, thinking, speaking, error, capturing, warmup).
+2. **GUI Class** — Fullscreen tkinter app (800x480, designed for the Pi's DSI touchscreen). The script sets `DISPLAY=:0` via `os.environ.setdefault` before importing tkinter, so it renders to the DSI display even when launched via SSH or systemd. Loads PNG animation sequences from `faces/[state]/` directories. Face state changes based on bot state (idle, listening, thinking, speaking, error, capturing, warmup).
 
 3. **Action Router** (`execute_action_and_get_result`) — Parses JSON actions from LLM output. Three tools: `get_time`, `search_web` (DuckDuckGo), `capture_image` (Pi camera via `rpicam-still`). Includes alias mapping (e.g., "google" → "search_web").
 
@@ -67,6 +67,10 @@ The Python code communicates with this stack using the `openai` Python package, 
 `config.json` controls: text model name, voice model path, chat memory toggle, camera rotation, LLM base URL, and a system prompt extension. The script merges user config over `DEFAULT_CONFIG` defaults.
 
 `config.yaml` is the llama-swap configuration that defines how to launch llama-server for each model, including GGUF paths, mmproj for vision, context size, and TTL.
+
+## Display
+
+The target display is the Raspberry Pi's DSI touchscreen interface (800x480). The script sets `os.environ.setdefault("DISPLAY", ":0")` at the top of `agent.py` before any tkinter imports, ensuring the GUI renders to the DSI screen regardless of launch context (local terminal, SSH, or systemd service). Users can override by setting `DISPLAY` before running.
 
 ## Audio Handling
 
