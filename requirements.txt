@@ -3,6 +3,7 @@ numpy
 scipy
 openwakeword
 onnxruntime
-openai
-duckduckgo-search
+anthropic
+python-dotenv
+ddgs
 Pillow

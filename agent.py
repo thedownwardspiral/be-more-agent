@@ -33,7 +33,7 @@ import wave
 import struct 
 
 # Suppress harmless library warnings
-warnings.filterwarnings("ignore", category=RuntimeWarning, module="duckduckgo_search")
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="ddgs")
 
 # Core dependencies
 import sounddevice as sd
@@ -43,11 +43,15 @@ import scipy.signal
 # --- AI ENGINES ---
 import openwakeword
 from openwakeword.model import Model
-from openai import OpenAI
+import anthropic
+from dotenv import load_dotenv
 import base64
 
+# Load environment variables from .env file
+load_dotenv()
+
 # --- WEB SEARCH (Using your working import) ---
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 # =========================================================================
 # 1. CONFIGURATION & CONSTANTS
@@ -63,17 +67,20 @@ WAKE_WORD_THRESHOLD = 0.5
 INPUT_DEVICE_NAME = None 
 
 DEFAULT_CONFIG = {
-    "text_model": "qwen3.5-4b",
-    "voice_model": "piper/en_GB-semaine-medium.onnx",
+    "text_model": "claude-sonnet-4-6",
+    "voice_model": "piper/en_US-bmo_voice.onnx",
+    "whisper_model": "./whisper.cpp/models/ggml-base.en.bin",
+    "whisper_threads": 2,
+    "audio_energy_threshold": 0.002,
     "chat_memory": True,
     "camera_rotation": 0,
-    "system_prompt_extras": "",
-    "llm_base_url": "http://localhost:8080/v1"
+    "system_prompt_extras": ""
 }
 
 # LLM SETTINGS
 LLM_TEMPERATURE = 0.7
 LLM_TOP_P = 0.9
+TTS_MIN_SENTENCE_LENGTH = 80
 
 def load_config():
     config = DEFAULT_CONFIG.copy()
@@ -87,13 +94,10 @@ def load_config():
     return config
 
 CURRENT_CONFIG = load_config()
-TEXT_MODEL = CURRENT_CONFIG["text_model"]
+TEXT_MODEL = os.environ.get("ANTHROPIC_MODEL", CURRENT_CONFIG["text_model"])
 
-# OpenAI-compatible client pointing at llama-swap
-llm_client = OpenAI(
-    base_url=CURRENT_CONFIG.get("llm_base_url", "http://localhost:8080/v1"),
-    api_key="not-needed"
-)
+# Anthropic client — reads ANTHROPIC_API_KEY from environment / .env
+llm_client = anthropic.Anthropic()
 
 class BotStates:
     IDLE = "idle"             
@@ -482,12 +486,15 @@ class BotGUI:
     def warm_up_logic(self):
         self.set_state(BotStates.WARMUP, "Warming up brains...")
         try:
-            llm_client.models.list()
-            print(f"llama-swap is reachable.", flush=True)
+            llm_client.messages.create(
+                model=TEXT_MODEL, max_tokens=1,
+                messages=[{"role": "user", "content": "hi"}]
+            )
+            print(f"Anthropic API is reachable. Model: {TEXT_MODEL}", flush=True)
         except Exception as e:
-            print(f"Failed to reach llama-swap: {e}", flush=True)
+            print(f"Failed to reach Anthropic API: {e}", flush=True)
         self.play_sound(self.get_random_sound(greeting_sounds_dir))
-        print("Models loaded.", flush=True)
+        print("Ready.", flush=True)
 
     def detect_wake_word_or_ptt(self):
         self.set_state(BotStates.IDLE, "Waiting...")
@@ -613,11 +620,31 @@ class BotGUI:
         self.play_sound(self.get_random_sound(ack_sounds_dir))
         return filename
 
+    def _check_audio_energy(self, filename):
+        """Return True if audio has enough energy to be worth transcribing."""
+        threshold = CURRENT_CONFIG.get("audio_energy_threshold", 0.002)
+        try:
+            with wave.open(filename, 'rb') as wf:
+                data = wf.readframes(wf.getnframes())
+            audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+            rms = np.sqrt(np.mean(audio ** 2))
+            print(f"[AUDIO] RMS energy: {rms:.6f} (threshold: {threshold})", flush=True)
+            return rms >= threshold
+        except Exception as e:
+            print(f"[AUDIO] Energy check failed: {e}", flush=True)
+            return True  # transcribe on error to be safe
+
     def transcribe_audio(self, filename):
+        if not self._check_audio_energy(filename):
+            print("[AUDIO] Skipping transcription — audio too quiet.", flush=True)
+            return ""
+
         print("Transcribing...", flush=True)
+        whisper_model = CURRENT_CONFIG.get("whisper_model", "./whisper.cpp/models/ggml-base.en.bin")
+        whisper_threads = str(CURRENT_CONFIG.get("whisper_threads", 2))
         try:
             result = subprocess.run(
-                ["./whisper.cpp/build/bin/whisper-cli", "-m", "./whisper.cpp/models/ggml-base.en.bin", "-l", "en", "-t", "4", "-f", filename],
+                ["./whisper.cpp/build/bin/whisper-cli", "-m", whisper_model, "-l", "en", "-t", whisper_threads, "-f", filename],
                 capture_output=True, text=True
             )
             transcription_lines = result.stdout.strip().split('\n')
@@ -650,71 +677,77 @@ class BotGUI:
     # 5. CHAT & RESPOND
     # =========================================================================
 
+    def _build_messages(self, text, img_path=None):
+        """Build the messages list and system prompt for the Anthropic API."""
+        if img_path:
+            with open(img_path, "rb") as f:
+                img_b64 = base64.b64encode(f.read()).decode("utf-8")
+            messages = [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                {"type": "text", "text": text}
+            ]}]
+        else:
+            # Combine history (skip system prompt entry) with new user message
+            history = []
+            for msg in (self.permanent_memory + self.session_memory):
+                if msg["role"] != "system":
+                    history.append(msg)
+            history.append({"role": "user", "content": text})
+            messages = history
+        return messages
+
     def chat_and_respond(self, text, img_path=None):
         if "forget everything" in text.lower() or "reset memory" in text.lower():
             self.session_memory = []
             self.permanent_memory = [{"role": "system", "content": SYSTEM_PROMPT}]
             self.save_chat_history()
-            with self.tts_queue_lock: 
+            with self.tts_queue_lock:
                 self.tts_queue.append("Okay. Memory wiped.")
             self.set_state(BotStates.IDLE, "Memory Wiped")
             return
 
         self.set_state(BotStates.THINKING, "Thinking...", cam_path=img_path)
 
-        messages = []
-        if img_path:
-            with open(img_path, "rb") as f:
-                img_b64 = base64.b64encode(f.read()).decode("utf-8")
-            messages = [{"role": "user", "content": [
-                {"type": "text", "text": text},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
-            ]}]
-        else:
-            user_msg = {"role": "user", "content": text}
-            messages = self.permanent_memory + self.session_memory + [user_msg]
-        
+        messages = self._build_messages(text, img_path)
+
         self.thinking_sound_active.set()
         threading.Thread(target=self._run_thinking_sound_loop, daemon=True).start()
-        
+
         full_response_buffer = ""
-        sentence_buffer = "" 
-        
+        sentence_buffer = ""
+
         try:
-            stream = llm_client.chat.completions.create(
-                model=TEXT_MODEL, messages=messages, stream=True,
-                temperature=LLM_TEMPERATURE, top_p=LLM_TOP_P
-            )
+            with llm_client.messages.stream(
+                model=TEXT_MODEL, messages=messages, system=SYSTEM_PROMPT,
+                max_tokens=1024, temperature=LLM_TEMPERATURE
+            ) as stream:
+                is_action_mode = False
 
-            is_action_mode = False
+                for content in stream.text_stream:
+                    if self.interrupted.is_set(): break
+                    if not content: continue
+                    full_response_buffer += content
 
-            for chunk in stream:
-                if self.interrupted.is_set(): break
-                delta = chunk.choices[0].delta if chunk.choices else None
-                content = delta.content if delta and delta.content else ""
-                if not content: continue
-                full_response_buffer += content
-                
-                if '{"' in content or "action:" in content.lower():
-                    is_action_mode = True
+                    if '{"' in content or "action:" in content.lower():
+                        is_action_mode = True
+                        self.thinking_sound_active.clear()
+                        continue
+
+                    if is_action_mode: continue
+
                     self.thinking_sound_active.clear()
-                    continue 
+                    if self.current_state != BotStates.SPEAKING:
+                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
+                        self.append_to_text("BOT: ", newline=False)
 
-                if is_action_mode: continue
+                    self._stream_to_text(content)
 
-                self.thinking_sound_active.clear()
-                if self.current_state != BotStates.SPEAKING:
-                    self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                    self.append_to_text("BOT: ", newline=False)
-
-                self._stream_to_text(content)
-                
-                sentence_buffer += content
-                if any(punct in content for punct in ".!?\n"):
-                    clean_sentence = sentence_buffer.strip()
-                    if clean_sentence and re.search(r'[a-zA-Z0-9]', clean_sentence):
-                        with self.tts_queue_lock: self.tts_queue.append(clean_sentence)
-                    sentence_buffer = ""
+                    sentence_buffer += content
+                    if re.search(r'[.!?][\s\n]*$', sentence_buffer) and len(sentence_buffer.strip()) >= TTS_MIN_SENTENCE_LENGTH:
+                        clean_sentence = sentence_buffer.strip()
+                        if clean_sentence and re.search(r'[a-zA-Z0-9]', clean_sentence):
+                            with self.tts_queue_lock: self.tts_queue.append(clean_sentence)
+                        sentence_buffer = ""
 
             if not is_action_mode and sentence_buffer.strip():
                 clean_sentence = sentence_buffer.strip()
@@ -743,7 +776,7 @@ class BotGUI:
                         new_img_path = self.capture_image()
                         if new_img_path:
                             self.chat_and_respond(text, img_path=new_img_path)
-                            return 
+                            return
 
                     elif tool_result == "INVALID_ACTION":
                         fallback_text = "I am not sure how to do that."
@@ -770,41 +803,45 @@ class BotGUI:
                         with self.tts_queue_lock: self.tts_queue.append(fallback_text)
 
                     elif tool_result:
-                        summary_prompt = [
-                            {"role": "system", "content": "Summarize this result in one short sentence."},
+                        summary_messages = [
                             {"role": "user", "content": f"RESULT: {tool_result}\nUser Question: {text}"}
                         ]
-                        
+
                         self.set_state(BotStates.THINKING, "Reading...")
                         self.thinking_sound_active.set()
-                        
-                        final_resp = llm_client.chat.completions.create(
-                            model=TEXT_MODEL, messages=summary_prompt, stream=False,
-                            temperature=LLM_TEMPERATURE, top_p=LLM_TOP_P
+
+                        final_resp = llm_client.messages.create(
+                            model=TEXT_MODEL, messages=summary_messages,
+                            system="Summarize this result in one short sentence.",
+                            max_tokens=256, temperature=LLM_TEMPERATURE
                         )
-                        final_text = final_resp.choices[0].message.content
-                        
+                        final_text = final_resp.content[0].text
+
                         self.thinking_sound_active.clear()
                         self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                        
+
                         self.append_to_text("BOT: ", newline=False)
                         self.append_to_text(final_text, newline=True)
                         with self.tts_queue_lock: self.tts_queue.append(final_text)
                         self.session_memory.append({"role": "assistant", "content": final_text})
             else:
                 self.append_to_text("")
-                self.session_memory.append({"role": "assistant", "content": full_response_buffer}) 
-            
+                self.session_memory.append({"role": "assistant", "content": full_response_buffer})
+
             self.wait_for_tts()
             self.set_state(BotStates.IDLE, "Ready")
-                
+
         except Exception as e:
             print(f"LLM Error: {e}")
             self.set_state(BotStates.ERROR, "Brain Freeze!")
 
     def wait_for_tts(self):
-        while self.tts_queue or self.tts_active.is_set():
+        while True:
             if self.interrupted.is_set(): break
+            with self.tts_queue_lock:
+                has_items = len(self.tts_queue) > 0
+            if not has_items and not self.tts_active.is_set():
+                break
             time.sleep(0.1)
 
     def _tts_worker(self):
@@ -819,61 +856,85 @@ class BotGUI:
                 self.tts_active.clear() 
             else: time.sleep(0.05)
 
+    def _speak_via_server(self, clean):
+        """Request raw audio from the persistent Piper HTTP server."""
+        import urllib.request
+        req = urllib.request.Request(
+            "http://127.0.0.1:5111/tts",
+            data=json.dumps({"text": clean}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        resp = urllib.request.urlopen(req, timeout=30)
+        return resp.read()
+
+    def _speak_via_subprocess(self, clean):
+        """Fallback: spawn a one-shot Piper process (reloads model each time)."""
+        voice_model = CURRENT_CONFIG.get("voice_model", "piper/en_US-bmo_voice.onnx")
+        self.current_audio_process = subprocess.Popen(
+            ["./piper/piper", "--model", voice_model, "--output-raw"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        self.current_audio_process.stdin.write(clean.encode() + b"\n")
+        self.current_audio_process.stdin.close()
+        return self.current_audio_process.stdout.read()
+
     def speak(self, text):
         clean = re.sub(r"[^\w\s,.!?:-]", "", text)
         if not clean.strip(): return
-        
+
         print(f"[PIPER SPEAKING] '{clean}'", flush=True)
-        voice_model = CURRENT_CONFIG.get("voice_model", "piper/en_GB-semaine-medium.onnx")
-        
+
         try:
-            self.current_audio_process = subprocess.Popen(
-                ["./piper/piper", "--model", voice_model, "--output-raw"], 
-                stdin=subprocess.PIPE, 
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL
-            )
-            
-            self.current_audio_process.stdin.write(clean.encode() + b'\n')
-            self.current_audio_process.stdin.close() 
+            # Try persistent Piper server first, fall back to subprocess
+            try:
+                raw_audio = self._speak_via_server(clean)
+            except Exception:
+                raw_audio = self._speak_via_subprocess(clean)
+
+            if not raw_audio:
+                return
 
             try:
                 device_info = sd.query_devices(kind='output')
                 native_rate = int(device_info['default_samplerate'])
             except:
-                native_rate = 48000 
+                native_rate = 48000
 
             PIPER_RATE = 22050
             use_native_rate = False
-            
+
             try:
                 sd.check_output_settings(device=None, samplerate=PIPER_RATE)
             except:
                 use_native_rate = True
 
-            with sd.RawOutputStream(samplerate=native_rate if use_native_rate else PIPER_RATE, 
-                                    channels=1, dtype='int16', 
-                                    device=None, latency='low', blocksize=2048) as stream:
-                while True:
+            audio_data = np.frombuffer(raw_audio, dtype=np.int16)
+            if use_native_rate:
+                num_samples = int(len(audio_data) * (native_rate / PIPER_RATE))
+                audio_data = scipy.signal.resample(audio_data, num_samples).astype(np.int16)
+
+            # Play in chunks to support interruption and volume tracking
+            chunk_size = 2048
+            with sd.RawOutputStream(samplerate=native_rate if use_native_rate else PIPER_RATE,
+                                    channels=1, dtype='int16',
+                                    device=None, latency='low', blocksize=chunk_size) as stream:
+                audio_bytes = audio_data.tobytes()
+                byte_step = chunk_size * 2  # 2 bytes per int16 sample
+                for i in range(0, len(audio_bytes), byte_step):
                     if self.interrupted.is_set(): break
-                    data = self.current_audio_process.stdout.read(4096)
-                    if not data: break 
-                    
-                    audio_chunk = np.frombuffer(data, dtype=np.int16)
-                    if len(audio_chunk) > 0:
-                        self.current_volume = np.max(np.abs(audio_chunk))
-                        if use_native_rate:
-                            num_samples = int(len(audio_chunk) * (native_rate / PIPER_RATE))
-                            audio_chunk = scipy.signal.resample(audio_chunk, num_samples).astype(np.int16)
-                        stream.write(audio_chunk.tobytes())
-                    else:
-                        self.current_volume = 0
-                time.sleep(0.5) 
-                    
+                    chunk = audio_bytes[i:i + byte_step]
+                    chunk_arr = np.frombuffer(chunk, dtype=np.int16)
+                    if len(chunk_arr) > 0:
+                        self.current_volume = np.max(np.abs(chunk_arr))
+                    stream.write(chunk)
+                time.sleep(0.5)
+
         except Exception as e:
             print(f"Audio Error: {e}")
         finally:
-            self.current_volume = 0 
+            self.current_volume = 0
             if self.current_audio_process:
                 if self.current_audio_process.stdout: self.current_audio_process.stdout.close()
                 if self.current_audio_process.poll() is None: self.current_audio_process.terminate()

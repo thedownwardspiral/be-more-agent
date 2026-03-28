@@ -4,20 +4,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Be More Agent is a single-file Python application (`agent.py`) that turns a Raspberry Pi into a local, offline conversational AI agent. It uses wake word detection, speech-to-text, a local LLM, and text-to-speech — all running on-device with no cloud APIs.
+Be More Agent is a single-file Python application (`agent.py`) that turns a Raspberry Pi into a conversational AI agent. It uses wake word detection, local speech-to-text (whisper.cpp), the Anthropic API (Claude) for LLM intelligence, and local text-to-speech (Piper TTS). An internet connection is required for the Anthropic API.
 
 ## Running the Project
 
 ```bash
-# First-time setup (installs system deps, Piper TTS, Python venv, llama.cpp, llama-swap, models)
+# First-time setup (installs system deps, Piper TTS, .bmo venv, whisper.cpp, anthropic SDK)
 chmod +x setup.sh
 ./setup.sh
 
-# Ensure llama-swap service is running
-sudo systemctl status llama-swap
+# Configure your Anthropic API key
+cp example.env .env
+# Edit .env and add your ANTHROPIC_API_KEY
+
+# Install and start the persistent Piper TTS server
+sudo cp piper-tts.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now piper-tts
 
 # Run the agent (auto-targets DSI display via DISPLAY=:0)
-source venv/bin/activate
+source .bmo/bin/activate
 python agent.py
 ```
 
@@ -29,7 +35,7 @@ Everything lives in `agent.py` — a single ~920-line script with one main class
 
 **`BotGUI`** — The entire application. It's a tkinter GUI that also manages all background threads. Key sections (marked with comment banners in the file):
 
-1. **Configuration & Constants** (top of file) — Loads `config.json`, defines `BotStates` enum, LLM settings, and the system prompt that instructs the LLM to output JSON for tool actions vs plain text for chat. Creates an OpenAI-compatible client (`llm_client`) pointing at llama-swap.
+1. **Configuration & Constants** (top of file) — Loads `config.json` and `.env`, defines `BotStates` enum, LLM settings, and the system prompt that instructs the LLM to output JSON for tool actions vs plain text for chat. Creates an Anthropic client (`llm_client`) using the `ANTHROPIC_API_KEY` from environment.
 
 2. **GUI Class** — Fullscreen tkinter app (800x480, designed for the Pi's DSI touchscreen). The script sets `DISPLAY=:0` via `os.environ.setdefault` before importing tkinter, so it renders to the DSI display even when launched via SSH or systemd. Loads PNG animation sequences from `faces/[state]/` directories. Face state changes based on bot state (idle, listening, thinking, speaking, error, capturing, warmup).
 
@@ -37,36 +43,34 @@ Everything lives in `agent.py` — a single ~920-line script with one main class
 
 4. **Core Logic** (`safe_main_execution`) — Main loop: detect wake word or PTT → record audio → transcribe → chat → speak. Two recording modes: adaptive silence detection and push-to-talk (Enter key).
 
-5. **Chat & Respond** (`chat_and_respond`) — Streams LLM response via OpenAI-compatible API (llama-swap → llama.cpp). During streaming, detects if output is JSON (action mode) or plain text (chat mode). For actions, executes the tool then sends results back to LLM for summarization. Vision requests send base64-encoded images in OpenAI message format.
+5. **Chat & Respond** (`chat_and_respond`) — Streams LLM response via the Anthropic Messages API. During streaming, detects if output is JSON (action mode) or plain text (chat mode). For actions, executes the tool then sends results back to Claude for summarization. Vision requests send base64-encoded images in Anthropic's native image format. Streamed text is buffered and flushed to TTS only when a sentence-ending punctuation mark is reached **and** the buffer meets a minimum length (`TTS_MIN_SENTENCE_LENGTH`, default 80 chars), preventing choppy playback of short fragments.
 
 **Key threading model:** The main loop runs in a daemon thread off the tkinter main thread. TTS has its own worker thread with a queue. Thinking sounds loop in short-lived threads. All state coordination uses `threading.Event` objects.
 
-## LLM Stack
+## LLM Integration
 
-The LLM stack has three layers:
+The agent uses the **Anthropic API** (Claude) for all LLM tasks. The `anthropic` Python SDK communicates directly with Claude's Messages API — no local inference server is needed.
 
-1. **llama-swap** — A Go binary running as a systemd service on port 8080. It exposes an OpenAI-compatible API and acts as a smart proxy. When a request arrives, it starts/stops the appropriate llama-server process based on the model name. Configured via `config.yaml`.
-
-2. **llama-server** (from llama.cpp) — The actual inference server. Built from source at `./llama.cpp/build/bin/llama-server`. Launched and managed by llama-swap with automatic port assignment via the `${PORT}` macro.
-
-3. **Qwen3.5-4B** — A single model that handles both text and vision. Uses Q4_K_M quantization (`models/Qwen3.5-4B-Q4_K_M.gguf`, 2.6 GB) with a separate multimodal projector (`models/mmproj-F16.gguf`, 642 MB) for image understanding.
-
-The Python code communicates with this stack using the `openai` Python package, with `base_url` pointed at `http://localhost:8080/v1`.
+- **API Key**: Read from `ANTHROPIC_API_KEY` in the `.env` file (loaded via `python-dotenv`)
+- **Model**: Defaults to `claude-sonnet-4-20250514`. Override via `ANTHROPIC_MODEL` env var or `text_model` in `config.json`
+- **Streaming**: Uses `client.messages.stream()` for real-time token delivery during conversation
+- **Vision**: Images are sent as base64-encoded content blocks in Anthropic's native format
 
 ## External Tool Chain (not in repo, installed by setup.sh)
 
-- **llama.cpp** — Built from source at `./llama.cpp/build/bin/llama-server`
-- **llama-swap** — Binary at `./llama-swap`, runs as systemd service, configured via `config.yaml`
-- **Qwen3.5-4B** — GGUF model files in `models/` (downloaded from `unsloth/Qwen3.5-4B-GGUF`)
-- **whisper.cpp** — Speech-to-text at `./whisper.cpp/build/bin/whisper-cli`
-- **Piper TTS** — Text-to-speech at `./piper/piper`
+- **whisper.cpp** — Speech-to-text at `./whisper.cpp/build/bin/whisper-cli`. Model and thread count configurable via `config.json` (`whisper_model`, `whisper_threads`). Defaults to `ggml-base.en.bin` with 2 threads to balance speed and CPU headroom.
+- **Piper TTS** — Text-to-speech binary at `./piper/piper`, kept running as a persistent process by `piper_server.py`
 - **OpenWakeWord** — Wake word detection from `wakeword.onnx`
+
+## Piper TTS Server
+
+`piper_server.py` runs Piper as a persistent HTTP service on `127.0.0.1:5111` to avoid reloading the ONNX voice model on every utterance. It maintains a single long-lived Piper subprocess, accepts POST requests with `{"text": "..."}`, and returns raw int16 audio at 22050 Hz. The agent tries the server first and falls back to spawning Piper directly if unavailable. A systemd unit file (`piper-tts.service`) is provided for auto-start.
 
 ## Configuration
 
-`config.json` controls: text model name, voice model path, chat memory toggle, camera rotation, LLM base URL, and a system prompt extension. The script merges user config over `DEFAULT_CONFIG` defaults.
+`.env` contains sensitive configuration (API keys). Copy `example.env` to `.env` and fill in your `ANTHROPIC_API_KEY`. The `.env` file is gitignored.
 
-`config.yaml` is the llama-swap configuration that defines how to launch llama-server for each model, including GGUF paths, mmproj for vision, context size, and TTL.
+`config.json` controls: Claude model name, voice model path, whisper model path, whisper thread count, audio energy threshold, chat memory toggle, camera rotation, and a system prompt extension. The script merges user config over `DEFAULT_CONFIG` defaults.
 
 ## Display
 
@@ -77,3 +81,5 @@ The target display is the Raspberry Pi's DSI touchscreen interface (800x480). Th
 ## Audio Handling
 
 The agent auto-detects microphone/speaker sample rates and resamples on the fly (using scipy) to match hardware capabilities. This is critical for Pi hardware compatibility — Piper outputs at 22050 Hz but many Pi audio devices only support 48000 Hz.
+
+An audio energy gate (`_check_audio_energy`) checks RMS energy of recorded audio before invoking whisper.cpp. If the audio is below the configurable threshold (`audio_energy_threshold` in `config.json`, default `0.002`), transcription is skipped entirely, avoiding unnecessary CPU spikes on blank/silent recordings.
