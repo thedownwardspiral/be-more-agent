@@ -48,7 +48,7 @@ agent.py  →  Anthropic Python SDK  →  Anthropic API  →  Claude (Sonnet/Opu
 
 - **agent.py** uses the `anthropic` Python package to call the Anthropic Messages API
 - **API key** is loaded from `.env` via `python-dotenv` (the `ANTHROPIC_API_KEY` env var)
-- **Model** defaults to `claude-sonnet-4-20250514`, configurable via `ANTHROPIC_MODEL` env var or `text_model` in `config.json`
+- **Model** defaults to `claude-sonnet-4-6`, configurable via `ANTHROPIC_MODEL` env var or `text_model` in `config.json`
 - **Vision** is supported natively — images are sent as base64-encoded content blocks
 
 ### Application Structure (agent.py)
@@ -87,14 +87,14 @@ Copy `example.env` to `.env` and set your key:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `ANTHROPIC_API_KEY` | Yes | Your Anthropic API key |
-| `ANTHROPIC_MODEL` | No | Override model (default: `claude-sonnet-4-20250514`) |
+| `ANTHROPIC_MODEL` | No | Override model (default: `claude-sonnet-4-6`) |
 
 ### config.json (agent settings)
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `text_model` | `"claude-sonnet-4-20250514"` | Anthropic model name (overridden by `ANTHROPIC_MODEL` env var) |
-| `voice_model` | `"piper/en_GB-semaine-medium.onnx"` | Piper TTS voice model path |
+| `text_model` | `"claude-sonnet-4-6"` | Anthropic model name (overridden by `ANTHROPIC_MODEL` env var) |
+| `voice_model` | `"piper/en_US-bmo_voice.onnx"` | Piper TTS voice model path |
 | `whisper_model` | `"./whisper.cpp/models/ggml-base.en.bin"` | Whisper.cpp model file path |
 | `whisper_threads` | `2` | CPU threads for whisper transcription |
 | `audio_energy_threshold` | `0.002` | RMS energy below which audio is skipped without transcription |
@@ -117,4 +117,4 @@ The GUI targets the Raspberry Pi's DSI touchscreen (800x480). `agent.py` sets `o
 ## Common Tasks
 
 ### Changing the Claude model
-Set `ANTHROPIC_MODEL` in `.env` or update `text_model` in `config.json`. Available models include `claude-sonnet-4-20250514`, `claude-opus-4-20250514`, `claude-haiku-4-5-20251001`.
+Set `ANTHROPIC_MODEL` in `.env` or update `text_model` in `config.json`. Available models include `claude-sonnet-4-6`, `claude-opus-4-6`, `claude-haiku-4-5-20251001`.

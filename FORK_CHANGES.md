@@ -152,7 +152,7 @@ added. The DuckDuckGo search package changed from `duckduckgo-search` to
 - **BLAS package**: Falls back to `libopenblas-dev` if `libatlas-base-dev`
   is not available (compatibility with newer Pi OS releases).
 - **Whisper.cpp**: Added a build step (step 6/7) that clones, compiles,
-  and downloads the `small.en-q8_0` model. The original did not include
+  and downloads the `base.en` model. The original did not include
   whisper.cpp setup.
 - **Ollama model pull removed**: The `ollama pull gemma3:1b` and
   `ollama pull moondream` steps were removed.

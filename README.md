@@ -109,6 +109,9 @@ The setup script downloads a default wake word ("Hey Jarvis"). To use your own:
 
 ### 5. Start the Piper TTS Server
 The agent uses a persistent Piper TTS HTTP server to avoid reloading the voice model on every utterance. Install it as a systemd service:
+
+**Note:** Before copying, edit `piper-tts.service` and update the `User`, `WorkingDirectory`, and `ExecStart` paths to match your username and install location.
+
 ```bash
 sudo cp piper-tts.service /etc/systemd/system/
 sudo systemctl daemon-reload
