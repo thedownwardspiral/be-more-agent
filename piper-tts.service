@@ -4,6 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
+# NOTE: Edit the User and paths below to match your system.
+# Replace "latte" with your username and update the paths accordingly.
 User=latte
 WorkingDirectory=/home/latte/be-more-agent
 ExecStart=/home/latte/be-more-agent/.bmo/bin/python /home/latte/be-more-agent/piper_server.py

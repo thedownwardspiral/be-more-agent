@@ -141,8 +141,8 @@ Copy `example.env` to `.env` and configure:
 # Anthropic API key (required)
 ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
-# Model override (optional, defaults to claude-sonnet-4-20250514)
-# ANTHROPIC_MODEL=claude-sonnet-4-20250514
+# Model override (optional, defaults to claude-sonnet-4-6)
+# ANTHROPIC_MODEL=claude-sonnet-4-6
 ```
 
 The `.env` file is gitignored and will never be committed.
@@ -153,8 +153,8 @@ You can modify the hardware behavior and personality in `config.json`:
 
 ```json
 {
-    "text_model": "claude-sonnet-4-20250514",
-    "voice_model": "piper/en_GB-semaine-medium.onnx",
+    "text_model": "claude-sonnet-4-6",
+    "voice_model": "piper/en_US-bmo_voice.onnx",
     "whisper_model": "./whisper.cpp/models/ggml-base.en.bin",
     "whisper_threads": 2,
     "audio_energy_threshold": 0.002,

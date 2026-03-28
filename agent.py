@@ -864,8 +864,8 @@ class BotGUI:
             data=json.dumps({"text": clean}).encode(),
             headers={"Content-Type": "application/json"},
         )
-        resp = urllib.request.urlopen(req, timeout=30)
-        return resp.read()
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read()
 
     def _speak_via_subprocess(self, clean):
         """Fallback: spawn a one-shot Piper process (reloads model each time)."""
