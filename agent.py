@@ -30,7 +30,8 @@ import atexit
 import datetime
 import warnings
 import wave
-import struct 
+import struct
+import queue
 
 # Suppress harmless library warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="ddgs")
@@ -177,9 +178,8 @@ class BotGUI:
         self.recording_active = threading.Event() 
         self.interrupted = threading.Event() 
         
-        self.tts_queue = []          
-        self.tts_queue_lock = threading.Lock() 
-        self.tts_thread = None       
+        self.tts_queue = queue.Queue()
+        self.tts_thread = None
         self.tts_active = threading.Event()
         self.current_audio_process = None 
         
@@ -284,8 +284,12 @@ class BotGUI:
         if self.current_state == BotStates.SPEAKING or self.current_state == BotStates.THINKING:
             self.interrupted.set()
             self.thinking_sound_active.clear()
-            with self.tts_queue_lock:
-                self.tts_queue.clear()
+            while not self.tts_queue.empty():
+                try:
+                    self.tts_queue.get_nowait()
+                    self.tts_queue.task_done()
+                except queue.Empty:
+                    break
             if self.current_audio_process:
                 try: self.current_audio_process.terminate()
                 except: pass
@@ -697,12 +701,19 @@ class BotGUI:
         return messages
 
     def chat_and_respond(self, text, img_path=None):
+        # Drain any stale items from a previous response
+        while not self.tts_queue.empty():
+            try:
+                self.tts_queue.get_nowait()
+                self.tts_queue.task_done()
+            except queue.Empty:
+                break
+
         if "forget everything" in text.lower() or "reset memory" in text.lower():
             self.session_memory = []
             self.permanent_memory = [{"role": "system", "content": SYSTEM_PROMPT}]
             self.save_chat_history()
-            with self.tts_queue_lock:
-                self.tts_queue.append("Okay. Memory wiped.")
+            self.tts_queue.put("Okay. Memory wiped.")
             self.set_state(BotStates.IDLE, "Memory Wiped")
             return
 
@@ -746,13 +757,13 @@ class BotGUI:
                     if re.search(r'[.!?][\s\n]*$', sentence_buffer) and len(sentence_buffer.strip()) >= TTS_MIN_SENTENCE_LENGTH:
                         clean_sentence = sentence_buffer.strip()
                         if clean_sentence and re.search(r'[a-zA-Z0-9]', clean_sentence):
-                            with self.tts_queue_lock: self.tts_queue.append(clean_sentence)
+                            self.tts_queue.put(clean_sentence)
                         sentence_buffer = ""
 
-            if not is_action_mode and sentence_buffer.strip():
+            if not self.interrupted.is_set() and not is_action_mode and sentence_buffer.strip():
                 clean_sentence = sentence_buffer.strip()
                 if re.search(r'[a-zA-Z0-9]', clean_sentence):
-                    with self.tts_queue_lock: self.tts_queue.append(clean_sentence)
+                    self.tts_queue.put(clean_sentence)
                 sentence_buffer = ""
 
             if is_action_mode:
@@ -766,7 +777,7 @@ class BotGUI:
                         self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
                         self.append_to_text("BOT: ", newline=False)
                         self.append_to_text(chat_text, newline=True)
-                        with self.tts_queue_lock: self.tts_queue.append(chat_text)
+                        self.tts_queue.put(chat_text)
                         self.session_memory.append({"role": "assistant", "content": chat_text})
                         self.wait_for_tts()
                         self.set_state(BotStates.IDLE, "Ready")
@@ -784,7 +795,7 @@ class BotGUI:
                         self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
                         self.append_to_text("BOT: ", newline=False)
                         self.append_to_text(fallback_text, newline=True)
-                        with self.tts_queue_lock: self.tts_queue.append(fallback_text)
+                        self.tts_queue.put(fallback_text)
 
                     elif tool_result == "SEARCH_EMPTY":
                         fallback_text = "I searched, but I couldn't find any news about that."
@@ -792,7 +803,7 @@ class BotGUI:
                         self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
                         self.append_to_text("BOT: ", newline=False)
                         self.append_to_text(fallback_text, newline=True)
-                        with self.tts_queue_lock: self.tts_queue.append(fallback_text)
+                        self.tts_queue.put(fallback_text)
 
                     elif tool_result == "SEARCH_ERROR":
                         fallback_text = "I cannot reach the internet right now."
@@ -800,7 +811,7 @@ class BotGUI:
                         self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
                         self.append_to_text("BOT: ", newline=False)
                         self.append_to_text(fallback_text, newline=True)
-                        with self.tts_queue_lock: self.tts_queue.append(fallback_text)
+                        self.tts_queue.put(fallback_text)
 
                     elif tool_result:
                         summary_messages = [
@@ -822,7 +833,7 @@ class BotGUI:
 
                         self.append_to_text("BOT: ", newline=False)
                         self.append_to_text(final_text, newline=True)
-                        with self.tts_queue_lock: self.tts_queue.append(final_text)
+                        self.tts_queue.put(final_text)
                         self.session_memory.append({"role": "assistant", "content": final_text})
             else:
                 self.append_to_text("")
@@ -836,25 +847,21 @@ class BotGUI:
             self.set_state(BotStates.ERROR, "Brain Freeze!")
 
     def wait_for_tts(self):
-        while True:
-            if self.interrupted.is_set(): break
-            with self.tts_queue_lock:
-                has_items = len(self.tts_queue) > 0
-            if not has_items and not self.tts_active.is_set():
-                break
-            time.sleep(0.1)
+        self.tts_queue.join()
 
     def _tts_worker(self):
         while True:
-            text = None
-            with self.tts_queue_lock:
-                if self.tts_queue: 
-                    text = self.tts_queue.pop(0)
-                    self.tts_active.set() 
-            if text: 
-                self.speak(text)
-                self.tts_active.clear() 
-            else: time.sleep(0.05)
+            try:
+                text = self.tts_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if self.interrupted.is_set():
+                self.tts_queue.task_done()
+                continue
+            self.tts_active.set()
+            self.speak(text)
+            self.tts_active.clear()
+            self.tts_queue.task_done()
 
     def _speak_via_server(self, clean):
         """Request raw audio from the persistent Piper HTTP server."""

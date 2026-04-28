@@ -58,7 +58,7 @@ class PiperProcess:
                     data = self.process.stdout.read(65536)
                     if data:
                         chunks.append(data)
-                        timeout = 0.5  # After first data arrives, use shorter timeout
+                        timeout = 3.0  # After first data arrives, allow time for inter-sentence gaps on Pi
                     else:
                         # read() returned empty on a non-blocking fd — no data yet
                         if chunks:
