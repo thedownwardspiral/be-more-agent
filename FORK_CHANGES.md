@@ -60,30 +60,43 @@ stack with the cloud-based Anthropic API (Claude).
 - The original had no `DISPLAY` handling; it required a local terminal
   session.
 
-## TTS: Persistent Piper Server
+## TTS: In-Process piper1-gpl
 
 The original spawned a new Piper subprocess for every utterance,
-reloading the voice model each time.
+reloading the voice model each time. This fork uses the
+[`piper-tts`](https://github.com/OHF-Voice/piper1-gpl) Python package
+and loads the voice once at startup, keeping it resident in-process for
+the lifetime of the agent. No subprocess, no separate server.
 
-### New files
+### Dependencies and setup
 
-- **`piper_server.py`** -- A persistent HTTP server on
-  `127.0.0.1:5111` that keeps a single Piper subprocess alive. Accepts
-  `POST /tts` with `{"text": "..."}` and returns raw int16 audio at
-  22050 Hz. Includes a `GET /` health check.
-- **`piper-tts.service`** -- A systemd unit file to run the server as a
-  system service with auto-restart.
+- `requirements.txt` adds `piper-tts`.
+- `setup.sh` no longer downloads the prebuilt `piper_linux_aarch64`
+  binary; instead it runs
+  `python -m piper.download_voices --data-dir piper en_US-bmo-medium`
+  inside the `.bmo` venv to fetch the voice `.onnx` + `.onnx.json` into
+  `piper/`.
 
 ### Agent-side changes
 
-- **`_speak_via_server()`** -- New method that sends text to the Piper
-  HTTP server and receives raw audio.
-- **`_speak_via_subprocess()`** -- Extracted from the original `speak()`
-  as a fallback when the server is unavailable.
-- **`speak()`** rewritten to try the server first, fall back to
-  subprocess, then resample and play audio in interruptible chunks.
-  The original streamed directly from Piper's stdout and resampled
-  per-chunk; the fork resamples the entire buffer once before playback.
+- **Import** of `from piper import PiperVoice` added at module load.
+- **`BotGUI.__init__`** loads the voice once via
+  `PiperVoice.load(voice_model)` and stores it on `self.piper_voice`.
+  Failure logs but does not crash the agent — TTS just degrades to
+  silent.
+- **`speak()`** rewritten to iterate `self.piper_voice.synthesize(text)`
+  and stream each int16 PCM chunk into `sd.RawOutputStream`. The
+  per-chunk `sample_rate` drives playback (and the `scipy.signal.resample`
+  fallback when the audio device doesn't natively support it),
+  replacing the hardcoded `PIPER_RATE = 22050` constant.
+- **`_speak_via_server`, `_speak_via_subprocess`, and
+  `self.current_audio_process`** removed entirely — there is no
+  subprocess or HTTP server to talk to.
+
+### Removed files
+
+The earlier persistent-server iteration of this fork has been retired:
+`piper_server.py` and `piper-tts.service` are gone.
 
 ## Whisper: Configurable Model and Threads
 
@@ -128,8 +141,6 @@ testing.
 | `.env`              | Gitignored file holding the actual API key   |
 | `CLAUDE.md`         | Project context for Claude Code              |
 | `AGENTS.md`         | Project context for AI coding agents         |
-| `piper_server.py`   | Persistent Piper TTS HTTP server             |
-| `piper-tts.service` | systemd unit for the TTS server              |
 
 ### `requirements.txt`
 
@@ -138,10 +149,12 @@ testing.
 | `ollama`            | `anthropic`     |
 | `duckduckgo-search` | `ddgs`          |
 | --                  | `python-dotenv` |
+| --                  | `piper-tts`     |
 
-The `ollama` package was removed and `anthropic` + `python-dotenv` were
-added. The DuckDuckGo search package changed from `duckduckgo-search` to
-`ddgs`.
+The `ollama` package was removed and `anthropic`, `python-dotenv`, and
+`piper-tts` were added. The DuckDuckGo search package changed from
+`duckduckgo-search` to `ddgs`. Piper is now consumed as a Python library
+instead of a prebuilt binary.
 
 ### `setup.sh`
 
@@ -163,7 +176,7 @@ added. The DuckDuckGo search package changed from `duckduckgo-search` to
 | ------------------------ | --------------------------------- | --------------------------------------- |
 | `text_model`             | `gemma3:1b`                       | `claude-sonnet-4-6`                     |
 | `vision_model`           | `moondream`                       | Removed (Claude handles vision)         |
-| `voice_model`            | `piper/en_GB-semaine-medium.onnx` | `piper/en_US-bmo_voice.onnx`            |
+| `voice_model`            | `piper/en_GB-semaine-medium.onnx` | `piper/en_US-bmo-medium.onnx`           |
 | `whisper_model`          | --                                | `./whisper.cpp/models/ggml-base.en.bin` |
 | `whisper_threads`        | --                                | `2`                                     |
 | `audio_energy_threshold` | --                                | `0.002`                                 |

@@ -9,16 +9,13 @@ Be More Agent is a single-file Python application (`agent.py`) that turns a Rasp
 ## Quick Start
 
 ```bash
-# Setup (installs system deps, whisper.cpp, Piper TTS, .bmo venv)
+# Setup (installs system deps, .bmo venv with piper-tts + anthropic SDK,
+# downloads a Piper voice into piper/, builds whisper.cpp)
 chmod +x setup.sh && ./setup.sh
 
 # Configure API key
 cp example.env .env
 # Edit .env and set ANTHROPIC_API_KEY
-
-# Start persistent Piper TTS server (systemd)
-sudo cp piper-tts.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now piper-tts
 
 # Run (auto-targets DSI display via DISPLAY=:0)
 source .bmo/bin/activate && python agent.py
@@ -30,13 +27,11 @@ There are no tests or linting configured.
 
 | File | Purpose |
 |------|---------|
-| `agent.py` | Entire application — single-file ~920-line tkinter GUI + LLM agent |
-| `piper_server.py` | Persistent Piper TTS HTTP server (keeps model loaded in memory) |
-| `piper-tts.service` | systemd unit file for auto-starting the TTS server |
+| `agent.py` | Entire application — single-file tkinter GUI + LLM agent (Piper voice loaded in-process via `PiperVoice.load()`) |
 | `config.json` | User-facing settings (model name, voice, camera, system prompt) |
 | `example.env` | Template for `.env` file (API keys) |
-| `setup.sh` | One-shot installer — system deps, whisper.cpp, Piper TTS, `.bmo` venv |
-| `requirements.txt` | Python dependencies |
+| `setup.sh` | One-shot installer — system deps, `.bmo` venv (incl. `piper-tts`), downloads a Piper voice, builds whisper.cpp |
+| `requirements.txt` | Python dependencies (includes `piper-tts`) |
 
 ## Architecture
 
@@ -94,7 +89,7 @@ Copy `example.env` to `.env` and set your key:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `text_model` | `"claude-sonnet-4-6"` | Anthropic model name (overridden by `ANTHROPIC_MODEL` env var) |
-| `voice_model` | `"piper/en_US-bmo_voice.onnx"` | Piper TTS voice model path |
+| `voice_model` | `"piper/en_US-bmo-medium.onnx"` | Piper TTS voice model path (sibling `.onnx.json` must be next to it; both written by `python -m piper.download_voices`) |
 | `whisper_model` | `"./whisper.cpp/models/ggml-base.en.bin"` | Whisper.cpp model file path |
 | `whisper_threads` | `2` | CPU threads for whisper transcription |
 | `audio_energy_threshold` | `0.002` | RMS energy below which audio is skipped without transcription |
@@ -107,7 +102,7 @@ Copy `example.env` to `.env` and set your key:
 | Tool | Location | Installed By |
 |------|----------|-------------|
 | whisper.cpp | `./whisper.cpp/build/bin/whisper-cli` (model/threads configurable via `config.json`) | `setup.sh` |
-| Piper TTS | `./piper/piper` (via `piper_server.py` HTTP service on port 5111) | `setup.sh` |
+| Piper TTS | [`piper-tts`](https://github.com/OHF-Voice/piper1-gpl) Python package; voice files in `piper/` | `setup.sh` (`pip install` + `python -m piper.download_voices --data-dir piper <voice>`) |
 | OpenWakeWord | `wakeword.onnx` | `setup.sh` |
 
 ## Display

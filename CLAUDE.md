@@ -9,18 +9,14 @@ Be More Agent is a single-file Python application (`agent.py`) that turns a Rasp
 ## Running the Project
 
 ```bash
-# First-time setup (installs system deps, Piper TTS, .bmo venv, whisper.cpp, anthropic SDK)
+# First-time setup (installs system deps, .bmo venv with piper-tts + anthropic SDK,
+# downloads a Piper voice into piper/, builds whisper.cpp)
 chmod +x setup.sh
 ./setup.sh
 
 # Configure your Anthropic API key
 cp example.env .env
 # Edit .env and add your ANTHROPIC_API_KEY
-
-# Install and start the persistent Piper TTS server
-sudo cp piper-tts.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now piper-tts
 
 # Run the agent (auto-targets DSI display via DISPLAY=:0)
 source .bmo/bin/activate
@@ -59,12 +55,12 @@ The agent uses the **Anthropic API** (Claude) for all LLM tasks. The `anthropic`
 ## External Tool Chain (not in repo, installed by setup.sh)
 
 - **whisper.cpp** — Speech-to-text at `./whisper.cpp/build/bin/whisper-cli`. Model and thread count configurable via `config.json` (`whisper_model`, `whisper_threads`). Defaults to `ggml-base.en.bin` with 2 threads to balance speed and CPU headroom.
-- **Piper TTS** — Text-to-speech binary at `./piper/piper`, kept running as a persistent process by `piper_server.py`
+- **Piper TTS** — Text-to-speech via the [`piper-tts`](https://github.com/OHF-Voice/piper1-gpl) Python package (installed into the `.bmo` venv from `requirements.txt`). Voice `.onnx` + `.onnx.json` files live in `piper/`, downloaded by `python -m piper.download_voices --data-dir piper <voice-name>` during setup. The model is loaded once at agent startup via `PiperVoice.load()` and stays resident in-process — no subprocess, no separate server.
 - **OpenWakeWord** — Wake word detection from `wakeword.onnx`
 
-## Piper TTS Server
+## Piper TTS
 
-`piper_server.py` runs Piper as a persistent HTTP service on `127.0.0.1:5111` to avoid reloading the ONNX voice model on every utterance. It maintains a single long-lived Piper subprocess, accepts POST requests with `{"text": "..."}`, and returns raw int16 audio at 22050 Hz. The agent tries the server first and falls back to spawning Piper directly if unavailable. A systemd unit file (`piper-tts.service`) is provided for auto-start.
+`PiperVoice.load()` is called once in `BotGUI.__init__` and the voice instance is reused for every utterance. `BotGUI.speak()` calls `self.piper_voice.synthesize(text)`, which yields streaming int16 PCM chunks; each chunk's `sample_rate` drives the playback `RawOutputStream` (resampled with `scipy.signal.resample` if the audio device doesn't natively support the voice's rate). Playback writes in 2048-sample sub-chunks and checks `self.interrupted` per sub-chunk so spacebar interrupts cut cleanly.
 
 ## Configuration
 
@@ -80,6 +76,6 @@ The target display is the Raspberry Pi's DSI touchscreen interface (800x480). Th
 
 ## Audio Handling
 
-The agent auto-detects microphone/speaker sample rates and resamples on the fly (using scipy) to match hardware capabilities. This is critical for Pi hardware compatibility — Piper outputs at 22050 Hz but many Pi audio devices only support 48000 Hz.
+The agent auto-detects microphone/speaker sample rates and resamples on the fly (using scipy) to match hardware capabilities. This is critical for Pi hardware compatibility — Piper voices typically emit at 22050 Hz (read per-chunk from `chunk.sample_rate`) but many Pi audio devices only support 48000 Hz.
 
 An audio energy gate (`_check_audio_energy`) checks RMS energy of recorded audio before invoking whisper.cpp. If the audio is below the configurable threshold (`audio_energy_threshold` in `config.json`, default `0.002`), transcription is skipped entirely, avoiding unnecessary CPU spikes on blank/silent recordings.

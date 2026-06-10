@@ -7,3 +7,4 @@ anthropic
 python-dotenv
 ddgs
 Pillow
+piper-tts

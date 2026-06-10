@@ -17,7 +17,7 @@ This project turns a Raspberry Pi into a fully functional, conversational AI age
 * **Hardware-Aware Audio**: Automatically detects your microphone's sample rate and resamples audio on the fly to prevent ALSA errors. Includes an audio energy gate that skips transcription on silent/blank recordings to save CPU.
 * **Smart Web Search**: Uses DuckDuckGo to find real-time news and information when Claude doesn't know the answer.
 * **Reactive Faces**: The GUI updates the character's face based on its state (Listening, Thinking, Speaking, Idle).
-* **Fast Text-to-Speech**: Uses **Piper TTS** via a persistent HTTP server (`piper_server.py`) so the voice model stays loaded in memory — no reload delay between utterances.
+* **Fast Text-to-Speech**: Uses **Piper TTS** ([piper1-gpl](https://github.com/OHF-Voice/piper1-gpl)) as an in-process Python library, so the voice model stays loaded in memory — no reload delay between utterances and no separate server to manage.
 
 ## 🛠️ Hardware Requirements
 
@@ -50,8 +50,6 @@ sudo raspi-config
 ```text
 be-more-agent/
 ├── agent.py                   # The main brain script
-├── piper_server.py            # Persistent Piper TTS HTTP server
-├── piper-tts.service          # systemd unit for the TTS server
 ├── setup.sh                   # Auto-installer script
 ├── .env                       # API keys (gitignored — copy from example.env)
 ├── example.env                # Template for .env
@@ -60,7 +58,7 @@ be-more-agent/
 ├── memory.json                # Conversation history
 ├── requirements.txt           # Python dependencies
 ├── whisper.cpp/               # Speech-to-Text engine
-├── piper/                     # Piper TTS engine & voice models
+├── piper/                     # Piper TTS voice models (.onnx + .onnx.json)
 ├── sounds/                    # Sound effects folder
 │   ├── greeting_sounds/       # Startup .wav files
 │   ├── thinking_sounds/       # Looping .wav files
@@ -93,7 +91,7 @@ cd be-more-agent
 chmod +x setup.sh
 ./setup.sh
 ```
-*The setup script will install system libraries, create necessary folders, download Piper TTS, build whisper.cpp, and set up the `.bmo` Python virtual environment (including the `anthropic` SDK and other dependencies from `requirements.txt`).*
+*The setup script will install system libraries, create necessary folders, set up the `.bmo` Python virtual environment (including the `piper-tts` and `anthropic` SDKs and other dependencies from `requirements.txt`), download a Piper voice via `python -m piper.download_voices`, and build whisper.cpp.*
 
 ### 3. Configure Your API Key
 ```bash
@@ -107,24 +105,7 @@ The setup script downloads a default wake word ("Hey Jarvis"). To use your own:
 2. Place the `.onnx` file in the root folder.
 3. Rename it to `wakeword.onnx`.
 
-### 5. Start the Piper TTS Server
-The agent uses a persistent Piper TTS HTTP server to avoid reloading the voice model on every utterance. Install it as a systemd service:
-
-**Note:** Before copying, edit `piper-tts.service` and update the `User`, `WorkingDirectory`, and `ExecStart` paths to match your username and install location.
-
-```bash
-sudo cp piper-tts.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now piper-tts
-```
-Or run it manually in a separate terminal:
-```bash
-source .bmo/bin/activate
-python piper_server.py
-```
-The agent will fall back to spawning Piper per-utterance if the server isn't running, but this is slower.
-
-### 6. Run the Agent
+### 5. Run the Agent
 ```bash
 source .bmo/bin/activate
 python agent.py
@@ -157,7 +138,7 @@ You can modify the hardware behavior and personality in `config.json`:
 ```json
 {
     "text_model": "claude-sonnet-4-6",
-    "voice_model": "piper/en_US-bmo_voice.onnx",
+    "voice_model": "piper/en_US-bmo-medium.onnx",
     "whisper_model": "./whisper.cpp/models/ggml-base.en.bin",
     "whisper_threads": 2,
     "audio_energy_threshold": 0.002,
@@ -170,7 +151,7 @@ You can modify the hardware behavior and personality in `config.json`:
 | Key | Description |
 |-----|-------------|
 | `text_model` | Anthropic model name (overridden by `ANTHROPIC_MODEL` env var if set) |
-| `voice_model` | Path to Piper TTS voice `.onnx` file |
+| `voice_model` | Path to Piper TTS voice `.onnx` file (with sibling `.onnx.json`, as written by `python -m piper.download_voices`) |
 | `whisper_model` | Path to whisper.cpp model file (default: `ggml-base.en.bin`) |
 | `whisper_threads` | Number of CPU threads for whisper transcription (default: `2`) |
 | `audio_energy_threshold` | RMS energy below which audio is skipped without transcription (default: `0.002`) |
@@ -195,7 +176,7 @@ This software is a generic framework. You can give it a new personality by repla
 * **"AuthenticationError" or API key errors:** Ensure your `.env` file exists and contains a valid `ANTHROPIC_API_KEY`. Copy from `example.env` if needed.
 * **"No search library found":** If web search fails, ensure you are in the `.bmo` virtual environment and `ddgs` is installed via pip.
 * **Shutdown Errors:** When you exit the script (Ctrl+C), you might see `Expression 'alsa_snd_pcm_mmap_begin' failed`. **This is normal.** It just means the audio stream was cut off mid-sample. It does not affect the functionality.
-* **Audio Glitches:** If the voice sounds fast or slow, the script attempts to auto-detect sample rates. Ensure your `config.json` points to a valid `.onnx` voice model in the `piper/` folder.
+* **Audio Glitches:** If the voice sounds fast or slow, the script attempts to auto-detect sample rates. Ensure your `config.json` points to a valid `.onnx` voice model in the `piper/` folder (with its sibling `.onnx.json` next to it). To switch voices, run `python -m piper.download_voices --data-dir piper <voice-name>` from within the `.bmo` venv.
 * **Choppy/Fragmented Speech:** If the TTS output sounds broken into tiny fragments, the `TTS_MIN_SENTENCE_LENGTH` constant in `agent.py` (default: 80 characters) controls how much text is buffered before being sent to Piper. Increase it for longer, smoother utterances.
 
 ## 📄 License

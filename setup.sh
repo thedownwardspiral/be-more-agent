@@ -43,34 +43,18 @@ mkdir -p faces/speaking
 mkdir -p faces/error
 mkdir -p faces/warmup
 
-# 3. Download Piper (Architecture Check)
-echo -e "${YELLOW}[3/7] Setting up Piper TTS...${NC}"
-ARCH=$(uname -m)
-if [ "$ARCH" == "aarch64" ]; then
-    # FIXED: Using the specific 2023.11.14-2 release known to work on Pi
-    wget -O piper.tar.gz https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_aarch64.tar.gz
-    tar -xvf piper.tar.gz -C piper --strip-components=1
-    rm piper.tar.gz
-else
-    echo -e "${RED}⚠️  Not on Raspberry Pi (aarch64). Skipping Piper download.${NC}"
-fi
-
-# 4. Download Voice Model
-echo -e "${YELLOW}[4/7] Downloading Voice Model...${NC}"
-cd piper
-wget -nc -O en_US-bmo_voice.onnx https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/bmo/medium/en_US-bmo-medium.onnx
-wget -nc -O en_US-bmo_voice.onnx.json https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/bmo/medium/en_US-bmo-medium.onnx.json
-cd ..
-
-# 5. Install Python Libraries
-echo -e "${YELLOW}[5/7] Installing Python Libraries...${NC}"
-# Check if .bmo venv exists, if not create it
+# 3. Install Python Libraries (Piper TTS now ships as a Python wheel)
+echo -e "${YELLOW}[3/7] Installing Python Libraries...${NC}"
 if [ ! -d ".bmo" ]; then
     python3 -m venv .bmo
 fi
 source .bmo/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
+
+# 4. Download Voice Model via piper1-gpl's downloader
+echo -e "${YELLOW}[4/7] Downloading Voice Model...${NC}"
+python -m piper.download_voices --data-dir piper en_US-bmo-medium
 
 # 6. Build whisper.cpp and download model
 echo -e "${YELLOW}[6/7] Building whisper.cpp...${NC}"

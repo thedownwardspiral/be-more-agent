@@ -45,6 +45,7 @@ import scipy.signal
 import openwakeword
 from openwakeword.model import Model
 import anthropic
+from piper import PiperVoice
 from dotenv import load_dotenv
 import base64
 
@@ -69,7 +70,7 @@ INPUT_DEVICE_NAME = None
 
 DEFAULT_CONFIG = {
     "text_model": "claude-sonnet-4-6",
-    "voice_model": "piper/en_US-bmo_voice.onnx",
+    "voice_model": "piper/en_US-bmo-medium.onnx",
     "whisper_model": "./whisper.cpp/models/ggml-base.en.bin",
     "whisper_threads": 2,
     "audio_energy_threshold": 0.002,
@@ -181,8 +182,17 @@ class BotGUI:
         self.tts_queue = queue.Queue()
         self.tts_thread = None
         self.tts_active = threading.Event()
-        self.current_audio_process = None 
-        
+
+        # --- PIPER TTS INITIALIZATION ---
+        print("[INIT] Loading Piper voice...", flush=True)
+        self.piper_voice = None
+        voice_model = CURRENT_CONFIG.get("voice_model", "piper/en_US-bmo-medium.onnx")
+        try:
+            self.piper_voice = PiperVoice.load(voice_model)
+            print(f"[INIT] Piper voice loaded: {voice_model}", flush=True)
+        except Exception as e:
+            print(f"[CRITICAL] Failed to load Piper voice '{voice_model}': {e}")
+
         # --- WAKE WORD INITIALIZATION ---
         print("[INIT] Loading Wake Word...", flush=True)
         self.oww_model = None
@@ -234,12 +244,6 @@ class BotGUI:
 
     def safe_exit(self):
         print("\n--- SHUTDOWN SEQUENCE ---", flush=True)
-        if self.current_audio_process:
-            try:
-                self.current_audio_process.terminate()
-                self.current_audio_process.wait(timeout=1)
-            except: pass
-
         self.recording_active.clear()
         self.thinking_sound_active.clear()
         self.tts_active.clear() 
@@ -290,9 +294,6 @@ class BotGUI:
                     self.tts_queue.task_done()
                 except queue.Empty:
                     break
-            if self.current_audio_process:
-                try: self.current_audio_process.terminate()
-                except: pass
             self.set_state(BotStates.IDLE, "Interrupted.")
 
     def load_animations(self):
@@ -863,89 +864,74 @@ class BotGUI:
             self.tts_active.clear()
             self.tts_queue.task_done()
 
-    def _speak_via_server(self, clean):
-        """Request raw audio from the persistent Piper HTTP server."""
-        import urllib.request
-        req = urllib.request.Request(
-            "http://127.0.0.1:5111/tts",
-            data=json.dumps({"text": clean}).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.read()
-
-    def _speak_via_subprocess(self, clean):
-        """Fallback: spawn a one-shot Piper process (reloads model each time)."""
-        voice_model = CURRENT_CONFIG.get("voice_model", "piper/en_US-bmo_voice.onnx")
-        self.current_audio_process = subprocess.Popen(
-            ["./piper/piper", "--model", voice_model, "--output-raw"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        self.current_audio_process.stdin.write(clean.encode() + b"\n")
-        self.current_audio_process.stdin.close()
-        return self.current_audio_process.stdout.read()
-
     def speak(self, text):
         clean = re.sub(r"[^\w\s,.!?:-]", "", text)
         if not clean.strip(): return
+        if self.piper_voice is None:
+            print("[PIPER] Voice not loaded; skipping playback.", flush=True)
+            return
 
         print(f"[PIPER SPEAKING] '{clean}'", flush=True)
 
         try:
-            # Try persistent Piper server first, fall back to subprocess
-            try:
-                raw_audio = self._speak_via_server(clean)
-            except Exception:
-                raw_audio = self._speak_via_subprocess(clean)
+            device_info = sd.query_devices(kind='output')
+            native_rate = int(device_info['default_samplerate'])
+        except Exception:
+            native_rate = 48000
 
-            if not raw_audio:
-                return
+        stream = None
+        playback_rate = None
+        resample = False
+        chunk_size = 2048
+        byte_step = chunk_size * 2  # 2 bytes per int16 sample
 
-            try:
-                device_info = sd.query_devices(kind='output')
-                native_rate = int(device_info['default_samplerate'])
-            except:
-                native_rate = 48000
+        try:
+            for chunk in self.piper_voice.synthesize(clean):
+                if self.interrupted.is_set():
+                    break
 
-            PIPER_RATE = 22050
-            use_native_rate = False
+                # Lazily open the output stream on the first chunk so we know the voice's sample rate.
+                if stream is None:
+                    voice_rate = chunk.sample_rate
+                    try:
+                        sd.check_output_settings(device=None, samplerate=voice_rate)
+                        playback_rate = voice_rate
+                    except Exception:
+                        playback_rate = native_rate
+                        resample = True
+                    stream = sd.RawOutputStream(
+                        samplerate=playback_rate, channels=1, dtype='int16',
+                        device=None, latency='low', blocksize=chunk_size,
+                    )
+                    stream.start()
 
-            try:
-                sd.check_output_settings(device=None, samplerate=PIPER_RATE)
-            except:
-                use_native_rate = True
+                audio = np.frombuffer(chunk.audio_int16_bytes, dtype=np.int16)
+                if resample:
+                    num_samples = int(len(audio) * (playback_rate / chunk.sample_rate))
+                    audio = scipy.signal.resample(audio, num_samples).astype(np.int16)
 
-            audio_data = np.frombuffer(raw_audio, dtype=np.int16)
-            if use_native_rate:
-                num_samples = int(len(audio_data) * (native_rate / PIPER_RATE))
-                audio_data = scipy.signal.resample(audio_data, num_samples).astype(np.int16)
-
-            # Play in chunks to support interruption and volume tracking
-            chunk_size = 2048
-            with sd.RawOutputStream(samplerate=native_rate if use_native_rate else PIPER_RATE,
-                                    channels=1, dtype='int16',
-                                    device=None, latency='low', blocksize=chunk_size) as stream:
-                audio_bytes = audio_data.tobytes()
-                byte_step = chunk_size * 2  # 2 bytes per int16 sample
+                audio_bytes = audio.tobytes()
                 for i in range(0, len(audio_bytes), byte_step):
-                    if self.interrupted.is_set(): break
-                    chunk = audio_bytes[i:i + byte_step]
-                    chunk_arr = np.frombuffer(chunk, dtype=np.int16)
-                    if len(chunk_arr) > 0:
-                        self.current_volume = np.max(np.abs(chunk_arr))
-                    stream.write(chunk)
+                    if self.interrupted.is_set():
+                        break
+                    sub = audio_bytes[i:i + byte_step]
+                    sub_arr = np.frombuffer(sub, dtype=np.int16)
+                    if len(sub_arr) > 0:
+                        self.current_volume = np.max(np.abs(sub_arr))
+                    stream.write(sub)
+
+            if stream is not None and not self.interrupted.is_set():
                 time.sleep(0.5)
 
         except Exception as e:
             print(f"Audio Error: {e}")
         finally:
             self.current_volume = 0
-            if self.current_audio_process:
-                if self.current_audio_process.stdout: self.current_audio_process.stdout.close()
-                if self.current_audio_process.poll() is None: self.current_audio_process.terminate()
-                self.current_audio_process = None
+            if stream is not None:
+                try: stream.stop()
+                except: pass
+                try: stream.close()
+                except: pass
 
     def _run_thinking_sound_loop(self):
         time.sleep(0.5)
