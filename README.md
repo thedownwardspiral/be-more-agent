@@ -51,6 +51,8 @@ sudo raspi-config
 be-more-agent/
 ├── agent.py                   # The main brain script
 ├── setup.sh                   # Auto-installer script
+├── start_agent.sh             # Launch script (activates .bmo venv, runs agent.py)
+├── be-more-agent.desktop      # Autostart template (installed to ~/.config/autostart/)
 ├── .env                       # API keys (gitignored — copy from example.env)
 ├── example.env                # Template for .env
 ├── config.json                # User settings (Model, Prompt, Hardware)
@@ -91,7 +93,7 @@ cd be-more-agent
 chmod +x setup.sh
 ./setup.sh
 ```
-*The setup script will install system libraries, create necessary folders, set up the `.bmo` Python virtual environment (including the `piper-tts` and `anthropic` SDKs and other dependencies from `requirements.txt`), download a Piper voice via `python -m piper.download_voices`, and build whisper.cpp.*
+*The setup script will install system libraries, create necessary folders, set up the `.bmo` Python virtual environment (including the `piper-tts` and `anthropic` SDKs and other dependencies from `requirements.txt`), download a Piper voice via `python -m piper.download_voices`, build whisper.cpp, and install a desktop autostart entry so the agent launches with the desktop session (remove `~/.config/autostart/be-more-agent.desktop` to disable).*
 
 ### 3. Configure Your API Key
 ```bash
@@ -144,7 +146,9 @@ You can modify the hardware behavior and personality in `config.json`:
     "audio_energy_threshold": 0.002,
     "chat_memory": true,
     "camera_rotation": 0,
-    "system_prompt_extras": "You are a helpful robot assistant. Keep responses short and cute."
+    "system_prompt_extras": "You are a helpful robot assistant. Keep responses short and cute.",
+    "input_device": null,
+    "input_sample_rate": null
 }
 ```
 
@@ -158,6 +162,8 @@ You can modify the hardware behavior and personality in `config.json`:
 | `chat_memory` | Enable/disable persistent chat history |
 | `camera_rotation` | Rotate camera image (0, 90, 180, 270) |
 | `system_prompt_extras` | Extra personality instructions appended to the system prompt |
+| `input_device` | Microphone to use — a device index, a name substring (e.g. `"USB"`), or `null` for the system default |
+| `input_sample_rate` | Preferred mic sample rate; the agent verifies it and falls back through 48000/44100/32000/16000 |
 
 ---
 

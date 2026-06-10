@@ -194,3 +194,80 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, module="duckduckgo_se
 # Fork
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="ddgs")
 ```
+
+## Native Anthropic Tool Use
+
+The original (and earlier versions of this fork) used a prompt-engineered
+protocol: the system prompt instructed the model to emit JSON like
+`{"action": "search_web", "value": "..."}`, and the streaming loop sniffed
+output for `'{"'` to detect "action mode", then regex-extracted the JSON
+and routed it through an alias map.
+
+This fork now uses the Anthropic API's native tool use:
+
+- **`TOOLS`** schemas (`get_time`, `search_web`, `capture_image`) are passed
+  via the `tools=` parameter on every streaming call.
+- **`execute_tool()`** replaces `execute_action_and_get_result()`. The alias
+  map, `CHAT_FALLBACK`, `INVALID_ACTION`, and canned fallback speech lines
+  are gone — Claude phrases tool results (including empty searches and
+  errors) naturally.
+- **`chat_and_respond()`** streams until `stop_reason == "tool_use"`, runs
+  the requested tools, appends the assistant content and `tool_result`
+  blocks, and loops (bounded by `MAX_TOOL_ROUNDS`). The separate
+  "summarize this result" second API call is gone — the follow-up response
+  has full conversation context.
+- **`extract_json_from_text()`** and the `'{"' in content` stream sniffing
+  were removed.
+
+## Vision Keeps Conversation History
+
+Previously a photo request restarted the conversation: the image was sent
+as a fresh single-message exchange with no history. Now `capture_image` is
+a tool, and the photo is returned as a base64 image block inside the
+`tool_result`, so Claude sees the image *and* the full conversation.
+
+The user message is now also persisted to session memory (previously only
+assistant replies were saved, so "memory" contained half the conversation).
+
+## Audio Robustness (back-ported from upstream)
+
+Upstream kept improving its audio stack after this fork diverged; these
+changes were ported back:
+
+- **`input_device` config key** + `resolve_input_device()` — select a
+  microphone by device index or name substring instead of always using the
+  system default.
+- **`input_sample_rate` config key** + `choose_input_samplerate()` —
+  candidate rates are verified with `sd.check_input_settings()` instead of
+  trusting the device's reported default.
+- **Nearest-neighbor resampling** in the wake-word loop — replaces
+  per-chunk `scipy.signal.resample` (FFT-based), which overloaded the Pi
+  CPU and caused buffer overflows.
+- **Silence gate before wake-word inference** — `oww_model.predict()` is
+  skipped when peak amplitude is ≤ 200, saving idle CPU.
+- **Stream retry** — if the wake-word stream fails, it is retried once with
+  fallback settings (blocksize 1024, high latency) before degrading to
+  push-to-talk. Persistent buffer overflows also trigger the fallback.
+- **`sd.stop()` + 0.2 s pause** before opening recording streams — hardware
+  contention freezes the Pi 5.
+- **`[AUDIO ERROR]` logging** in both recording paths (failures were
+  previously silent and looked identical to "heard nothing").
+- **`safe_exit()` reentrancy guard** — it is reachable from the Exit
+  button, Escape, and `atexit`; an `exiting` flag makes it run once, and
+  the `sys.exit(0)` call (which re-triggered atexit from inside a Tk
+  callback) was removed.
+
+## Desktop Autostart
+
+`start_agent.sh` (activates the `.bmo` venv and execs `agent.py`) and a
+`be-more-agent.desktop` template were added, mirroring upstream's launch
+story. `setup.sh` substitutes the repo path into the template and installs
+it to `~/.config/autostart/`, replacing the systemd unit that was retired
+with the Piper server. Remove `~/.config/autostart/be-more-agent.desktop`
+to disable.
+
+## config.json Cleanup
+
+The unused `system_prompt` key (which still described the old JSON action
+protocol; the code reads `system_prompt_extras`) was removed, and
+`input_device` / `input_sample_rate` were added with `null` defaults.

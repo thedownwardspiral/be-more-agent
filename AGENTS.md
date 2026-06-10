@@ -30,8 +30,10 @@ There are no tests or linting configured.
 | `agent.py` | Entire application — single-file tkinter GUI + LLM agent (Piper voice loaded in-process via `PiperVoice.load()`) |
 | `config.json` | User-facing settings (model name, voice, camera, system prompt) |
 | `example.env` | Template for `.env` file (API keys) |
-| `setup.sh` | One-shot installer — system deps, `.bmo` venv (incl. `piper-tts`), downloads a Piper voice, builds whisper.cpp |
+| `setup.sh` | One-shot installer — system deps, `.bmo` venv (incl. `piper-tts`), downloads a Piper voice, builds whisper.cpp, installs desktop autostart |
 | `requirements.txt` | Python dependencies (includes `piper-tts`) |
+| `start_agent.sh` | Launch script — activates `.bmo` venv and execs `agent.py` |
+| `be-more-agent.desktop` | Autostart template; `setup.sh` substitutes the repo path and copies it to `~/.config/autostart/` |
 
 ## Architecture
 
@@ -44,7 +46,8 @@ agent.py  →  Anthropic Python SDK  →  Anthropic API  →  Claude (Sonnet/Opu
 - **agent.py** uses the `anthropic` Python package to call the Anthropic Messages API
 - **API key** is loaded from `.env` via `python-dotenv` (the `ANTHROPIC_API_KEY` env var)
 - **Model** defaults to `claude-sonnet-4-6`, configurable via `ANTHROPIC_MODEL` env var or `text_model` in `config.json`
-- **Vision** is supported natively — images are sent as base64-encoded content blocks
+- **Tools** use Anthropic native tool use (the `tools=` parameter with `TOOLS` schemas), not prompt-engineered JSON
+- **Vision** is supported natively — the `capture_image` tool returns the photo as a base64 image block inside the `tool_result`, so Claude sees it with full conversation history
 
 ### Application Structure (agent.py)
 
@@ -52,9 +55,9 @@ The entire app is one class, `BotGUI`, with these sections marked by comment ban
 
 1. **Configuration & Constants** — `config.json` + `.env` loading, `DEFAULT_CONFIG`, Anthropic client setup, system prompt, `BotStates` enum
 2. **GUI Class** — tkinter fullscreen app (800x480, targets DSI display via `DISPLAY=:0`), PNG face animations from `faces/[state]/`
-3. **Action Router** (`execute_action_and_get_result`) — JSON action parsing, three tools: `get_time`, `search_web`, `capture_image`
+3. **Tool Execution** (`execute_tool`) — runs tools Claude requests via native tool use: `get_time`, `search_web`, `capture_image` (returns the photo as an image block in the `tool_result`)
 4. **Core Logic** (`safe_main_execution`) — Main loop: wake word/PTT → record → transcribe → chat → speak
-5. **Chat & Respond** (`chat_and_respond`) — Streaming Anthropic API calls, action mode vs chat mode detection, vision via base64 images. TTS sentence buffer requires minimum length (`TTS_MIN_SENTENCE_LENGTH`, 80 chars) before flushing to avoid choppy short-fragment playback
+5. **Chat & Respond** (`chat_and_respond`) — Streams responses with `tools=TOOLS`; on `stop_reason == "tool_use"` it executes the requested tools, appends `tool_result` blocks, and loops (up to `MAX_TOOL_ROUNDS`). TTS sentence buffer requires minimum length (`TTS_MIN_SENTENCE_LENGTH`, 80 chars) before flushing to avoid choppy short-fragment playback
 
 ### Threading Model
 
@@ -65,11 +68,12 @@ The entire app is one class, `BotGUI`, with these sections marked by comment ban
 
 ### Vision Handling
 
-Vision uses Claude's native multimodal support. Images are base64-encoded and sent in Anthropic's content block format:
+Vision uses Claude's native multimodal support via the `capture_image` tool. When Claude requests a photo, the camera capture is base64-encoded and returned as an image block inside the `tool_result`, preserving the full conversation history:
 ```python
 {"role": "user", "content": [
-    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "..."}},
-    {"type": "text", "text": "What do you see?"}
+    {"type": "tool_result", "tool_use_id": "...", "content": [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "..."}}
+    ]}
 ]}
 ```
 
@@ -96,6 +100,8 @@ Copy `example.env` to `.env` and set your key:
 | `chat_memory` | `true` | Persist conversation history to `memory.json` |
 | `camera_rotation` | `0` | Rotate camera captures (0/90/180/270) |
 | `system_prompt_extras` | `""` | Appended to the base system prompt |
+| `input_device` | `null` | Microphone selection — device index, name substring, or `null` for system default |
+| `input_sample_rate` | `null` | Preferred input sample rate; verified with `sd.check_input_settings()`, falls back through 48000/44100/32000/16000 |
 
 ## External Dependencies (not in repo)
 
@@ -108,6 +114,8 @@ Copy `example.env` to `.env` and set your key:
 ## Display
 
 The GUI targets the Raspberry Pi's DSI touchscreen (800x480). `agent.py` sets `os.environ.setdefault("DISPLAY", ":0")` before importing tkinter, so it works from SSH or systemd without extra config. Override by setting `DISPLAY` before launching.
+
+`setup.sh` installs a desktop autostart entry (`~/.config/autostart/be-more-agent.desktop`) that runs `start_agent.sh` when the desktop session starts. Delete that file to disable autostart.
 
 ## Common Tasks
 

@@ -20,7 +20,7 @@ if ! command -v lightdm &>/dev/null && ! command -v gdm3 &>/dev/null && ! comman
 fi
 
 # 1. Install System Dependencies (The "Hidden" Requirements)
-echo -e "${YELLOW}[1/7] Installing System Tools (apt)...${NC}"
+echo -e "${YELLOW}[1/8] Installing System Tools (apt)...${NC}"
 sudo apt update
 BLAS_PKG="libopenblas-dev"
 if apt-cache policy libatlas-base-dev 2>/dev/null | grep -q "Candidate:" && \
@@ -30,7 +30,7 @@ fi
 sudo apt install -y python3-tk libasound2-dev libportaudio2 "$BLAS_PKG" cmake build-essential espeak-ng git
 
 # 2. Create Folders
-echo -e "${YELLOW}[2/7] Creating Folders...${NC}"
+echo -e "${YELLOW}[2/8] Creating Folders...${NC}"
 mkdir -p piper
 mkdir -p sounds/greeting_sounds
 mkdir -p sounds/thinking_sounds
@@ -44,7 +44,7 @@ mkdir -p faces/error
 mkdir -p faces/warmup
 
 # 3. Install Python Libraries (Piper TTS now ships as a Python wheel)
-echo -e "${YELLOW}[3/7] Installing Python Libraries...${NC}"
+echo -e "${YELLOW}[3/8] Installing Python Libraries...${NC}"
 if [ ! -d ".bmo" ]; then
     python3 -m venv .bmo
 fi
@@ -53,11 +53,11 @@ pip install --upgrade pip
 pip install -r requirements.txt
 
 # 4. Download Voice Model via piper1-gpl's downloader
-echo -e "${YELLOW}[4/7] Downloading Voice Model...${NC}"
+echo -e "${YELLOW}[4/8] Downloading Voice Model...${NC}"
 python -m piper.download_voices --data-dir piper en_US-bmo-medium
 
-# 6. Build whisper.cpp and download model
-echo -e "${YELLOW}[6/7] Building whisper.cpp...${NC}"
+# 5. Build whisper.cpp and download model
+echo -e "${YELLOW}[5/8] Building whisper.cpp...${NC}"
 if [ ! -d "whisper.cpp" ]; then
     git clone https://github.com/ggerganov/whisper.cpp.git
 fi
@@ -69,10 +69,21 @@ if [ ! -f "models/ggml-base.en.bin" ]; then
 fi
 cd ..
 
-# 7. OpenWakeWord Model
+# 6. OpenWakeWord Model
+echo -e "${YELLOW}[6/8] Checking Wake Word Model...${NC}"
 if [ ! -f "wakeword.onnx" ]; then
     echo -e "${YELLOW}Downloading default 'Hey Jarvis' wake word...${NC}"
     curl -L -o wakeword.onnx https://github.com/dscripka/openWakeWord/raw/main/openwakeword/resources/models/hey_jarvis_v0.1.onnx
 fi
 
+# 7. Launch script
+echo -e "${YELLOW}[7/8] Making launch script executable...${NC}"
+chmod +x start_agent.sh
+
+# 8. Desktop autostart entry (starts the agent with the desktop session)
+echo -e "${YELLOW}[8/8] Installing desktop autostart entry...${NC}"
+mkdir -p "$HOME/.config/autostart"
+sed "s|__BASE_DIR__|$(pwd)|g" be-more-agent.desktop > "$HOME/.config/autostart/be-more-agent.desktop"
+
 echo -e "${GREEN}✨ Setup Complete! Run 'source .bmo/bin/activate' then 'python agent.py'${NC}"
+echo -e "${GREEN}   The agent will also autostart with the desktop session (remove ~/.config/autostart/be-more-agent.desktop to disable).${NC}"

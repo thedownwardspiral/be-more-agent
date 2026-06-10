@@ -31,15 +31,15 @@ Everything lives in `agent.py` — a single ~920-line script with one main class
 
 **`BotGUI`** — The entire application. It's a tkinter GUI that also manages all background threads. Key sections (marked with comment banners in the file):
 
-1. **Configuration & Constants** (top of file) — Loads `config.json` and `.env`, defines `BotStates` enum, LLM settings, and the system prompt that instructs the LLM to output JSON for tool actions vs plain text for chat. Creates an Anthropic client (`llm_client`) using the `ANTHROPIC_API_KEY` from environment.
+1. **Configuration & Constants** (top of file) — Loads `config.json` and `.env`, defines `BotStates` enum, LLM settings, the system prompt, and the `TOOLS` schemas for Anthropic native tool use. Creates an Anthropic client (`llm_client`) using the `ANTHROPIC_API_KEY` from environment. Also defines `resolve_input_device()` / `choose_input_samplerate()` which pick a microphone (via the `input_device` config key) and a verified sample rate.
 
 2. **GUI Class** — Fullscreen tkinter app (800x480, designed for the Pi's DSI touchscreen). The script sets `DISPLAY=:0` via `os.environ.setdefault` before importing tkinter, so it renders to the DSI display even when launched via SSH or systemd. Loads PNG animation sequences from `faces/[state]/` directories. Face state changes based on bot state (idle, listening, thinking, speaking, error, capturing, warmup).
 
-3. **Action Router** (`execute_action_and_get_result`) — Parses JSON actions from LLM output. Three tools: `get_time`, `search_web` (DuckDuckGo), `capture_image` (Pi camera via `rpicam-still`). Includes alias mapping (e.g., "google" → "search_web").
+3. **Tool Execution** (`execute_tool`) — Runs tools requested by Claude via native tool use. Three tools: `get_time`, `search_web` (DuckDuckGo), `capture_image` (Pi camera via `rpicam-still`). `capture_image` returns the photo as a base64 image block inside the `tool_result`, so Claude sees it with the full conversation history.
 
-4. **Core Logic** (`safe_main_execution`) — Main loop: detect wake word or PTT → record audio → transcribe → chat → speak. Two recording modes: adaptive silence detection and push-to-talk (Enter key).
+4. **Core Logic** (`safe_main_execution`) — Main loop: detect wake word or PTT → record audio → transcribe → chat → speak. Two recording modes: adaptive silence detection and push-to-talk (Enter key). The wake-word listener (`_listen_loop`) uses cheap nearest-neighbor resampling, skips inference on near-silence, and retries once with fallback stream settings (blocksize 1024, high latency) before degrading to PTT.
 
-5. **Chat & Respond** (`chat_and_respond`) — Streams LLM response via the Anthropic Messages API. During streaming, detects if output is JSON (action mode) or plain text (chat mode). For actions, executes the tool then sends results back to Claude for summarization. Vision requests send base64-encoded images in Anthropic's native image format. Streamed text is buffered and flushed to TTS only when a sentence-ending punctuation mark is reached **and** the buffer meets a minimum length (`TTS_MIN_SENTENCE_LENGTH`, default 80 chars), preventing choppy playback of short fragments.
+5. **Chat & Respond** (`chat_and_respond`) — Streams the response via the Anthropic Messages API with `tools=TOOLS`. When the stream ends with `stop_reason == "tool_use"`, it executes the requested tools, appends the assistant content and `tool_result` blocks to the messages, and loops (bounded by `MAX_TOOL_ROUNDS`) so Claude can use the results in context. Streamed text is buffered and flushed to TTS only when a sentence-ending punctuation mark is reached **and** the buffer meets a minimum length (`TTS_MIN_SENTENCE_LENGTH`, default 80 chars), preventing choppy playback of short fragments.
 
 **Key threading model:** The main loop runs in a daemon thread off the tkinter main thread. TTS has its own worker thread with a queue. Thinking sounds loop in short-lived threads. All state coordination uses `threading.Event` objects.
 
@@ -50,7 +50,8 @@ The agent uses the **Anthropic API** (Claude) for all LLM tasks. The `anthropic`
 - **API Key**: Read from `ANTHROPIC_API_KEY` in the `.env` file (loaded via `python-dotenv`)
 - **Model**: Defaults to `claude-sonnet-4-6`. Override via `ANTHROPIC_MODEL` env var or `text_model` in `config.json`
 - **Streaming**: Uses `client.messages.stream()` for real-time token delivery during conversation
-- **Vision**: Images are sent as base64-encoded content blocks in Anthropic's native format
+- **Tool use**: Native Anthropic tool use (`tools=` parameter) — no prompt-engineered JSON protocol or output sniffing
+- **Vision**: The `capture_image` tool returns the camera photo as a base64 image block inside the `tool_result`, so vision requests keep the full conversation history
 
 ## External Tool Chain (not in repo, installed by setup.sh)
 
@@ -66,13 +67,15 @@ The agent uses the **Anthropic API** (Claude) for all LLM tasks. The `anthropic`
 
 `.env` contains sensitive configuration (API keys). Copy `example.env` to `.env` and fill in your `ANTHROPIC_API_KEY`. The `.env` file is gitignored.
 
-`config.json` controls: Claude model name, voice model path, whisper model path, whisper thread count, audio energy threshold, chat memory toggle, camera rotation, and a system prompt extension. The script merges user config over `DEFAULT_CONFIG` defaults.
+`config.json` controls: Claude model name, voice model path, whisper model path, whisper thread count, audio energy threshold, chat memory toggle, camera rotation, a system prompt extension, microphone selection (`input_device` — index, name substring, or `null` for default), and a preferred input sample rate (`input_sample_rate`). The script merges user config over `DEFAULT_CONFIG` defaults.
 
 ## Display
 
 **A desktop environment (X11/Wayland) is required.** The agent uses tkinter for its GUI, which needs a running display server. A headless/server-only Pi OS installation will fail with `couldn't connect to display ":0"`. If using Pi OS Lite, install `lightdm` and configure desktop autologin via `raspi-config`.
 
 The target display is the Raspberry Pi's DSI touchscreen interface (800x480). The script sets `os.environ.setdefault("DISPLAY", ":0")` at the top of `agent.py` before any tkinter imports, ensuring the GUI renders to the DSI screen regardless of launch context (local terminal, SSH, or systemd service). Users can override by setting `DISPLAY` before running.
+
+`setup.sh` installs a desktop autostart entry: it substitutes the repo path into `be-more-agent.desktop` and copies it to `~/.config/autostart/`, which launches `start_agent.sh` (activates the `.bmo` venv, execs `agent.py`) when the desktop session starts. Remove that file to disable autostart.
 
 ## Audio Handling
 

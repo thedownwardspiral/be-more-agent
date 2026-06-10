@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Be More Agent
+Comment=Launch the Be More Agent
+Exec=__BASE_DIR__/start_agent.sh
+Path=__BASE_DIR__
+Icon=__BASE_DIR__/faces/idle/idle 01.png
+Terminal=true
+Categories=Utility;

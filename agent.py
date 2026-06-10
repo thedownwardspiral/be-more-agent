@@ -65,9 +65,6 @@ BMO_IMAGE_FILE = "current_image.jpg"
 WAKE_WORD_MODEL = "./wakeword.onnx"
 WAKE_WORD_THRESHOLD = 0.5
 
-# HARDWARE SETTINGS
-INPUT_DEVICE_NAME = None 
-
 DEFAULT_CONFIG = {
     "text_model": "claude-sonnet-4-6",
     "voice_model": "piper/en_US-bmo-medium.onnx",
@@ -76,12 +73,15 @@ DEFAULT_CONFIG = {
     "audio_energy_threshold": 0.002,
     "chat_memory": True,
     "camera_rotation": 0,
-    "system_prompt_extras": ""
+    "system_prompt_extras": "",
+    "input_device": None,
+    "input_sample_rate": None
 }
 
 # LLM SETTINGS
 LLM_TEMPERATURE = 0.7
 LLM_TOP_P = 0.9
+MAX_TOOL_ROUNDS = 5
 TTS_MIN_SENTENCE_LENGTH = 80
 
 def load_config():
@@ -101,6 +101,66 @@ TEXT_MODEL = os.environ.get("ANTHROPIC_MODEL", CURRENT_CONFIG["text_model"])
 # Anthropic client — reads ANTHROPIC_API_KEY from environment / .env
 llm_client = anthropic.Anthropic()
 
+def resolve_input_device(config):
+    requested = config.get("input_device")
+    if requested in (None, "", "default"):
+        return None
+
+    try:
+        devices = sd.query_devices()
+    except Exception as e:
+        print(f"[AUDIO] Device query failed: {e}", flush=True)
+        return None
+
+    if isinstance(requested, int) or (isinstance(requested, str) and requested.isdigit()):
+        index = int(requested)
+        if 0 <= index < len(devices):
+            return index
+        print(f"[AUDIO] Input device index not found: {index}", flush=True)
+        return None
+
+    requested_lower = str(requested).lower()
+    for idx, dev in enumerate(devices):
+        if dev.get("max_input_channels", 0) > 0 and requested_lower in dev.get("name", "").lower():
+            return idx
+
+    print(f"[AUDIO] Input device name not found: {requested}", flush=True)
+    return None
+
+INPUT_DEVICE_NAME = resolve_input_device(CURRENT_CONFIG)
+if INPUT_DEVICE_NAME is not None:
+    try:
+        device_info = sd.query_devices(INPUT_DEVICE_NAME)
+        print(f"[AUDIO] Using input device: {device_info.get('name', INPUT_DEVICE_NAME)}", flush=True)
+    except Exception:
+        print(f"[AUDIO] Using input device index: {INPUT_DEVICE_NAME}", flush=True)
+
+def choose_input_samplerate(device, preferred=None):
+    """Pick a sample rate the input device actually supports."""
+    candidates = []
+    if preferred:
+        candidates.append(int(preferred))
+    try:
+        device_info = sd.query_devices(device, kind='input') if device is not None else sd.query_devices(kind='input')
+        if "default_samplerate" in device_info:
+            candidates.append(int(device_info["default_samplerate"]))
+    except Exception as e:
+        print(f"[AUDIO] Input device query failed: {e}", flush=True)
+
+    candidates.extend([48000, 44100, 32000, 16000])
+    seen = set()
+    for rate in candidates:
+        if not rate or rate in seen:
+            continue
+        seen.add(rate)
+        try:
+            sd.check_input_settings(device=device, samplerate=rate, channels=1, dtype="int16")
+            return rate
+        except Exception:
+            continue
+
+    return int(candidates[0]) if candidates else 44100
+
 class BotStates:
     IDLE = "idle"             
     LISTENING = "listening"   
@@ -115,28 +175,39 @@ BASE_SYSTEM_PROMPT = """You are a helpful robot assistant running on a Raspberry
 Personality: Cute, helpful, robot.
 Style: Short sentences. Enthusiastic.
 
-INSTRUCTIONS:
-- If the user asks for a physical action (time, search, photo), output JSON.
-- If the user just wants to chat, reply with NORMAL TEXT.
+You have real tools: you can check the time, search the web, and take a photo
+with your camera to see your surroundings. Use a tool whenever the user asks
+for something a tool provides; otherwise just chat.
 
-### EXAMPLES ###
-
-User: What time is it?
-You: {"action": "get_time", "value": "now"}
-
-User: Hello!
-You: Hi! I am ready to help!
-
-User: Search for news about robots.
-You: {"action": "search_web", "value": "robots news"}
-
-User: What do you see right now?
-You: {"action": "capture_image", "value": "environment"}
-
-### END EXAMPLES ###
+Your replies are spoken aloud, so keep them short and conversational.
 """
 
 SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n\n" + CURRENT_CONFIG.get("system_prompt_extras", "")
+
+# --- TOOL DEFINITIONS (Anthropic native tool use) ---
+TOOLS = [
+    {
+        "name": "get_time",
+        "description": "Get the current local time.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "search_web",
+        "description": "Search the web for news or current information.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The search query."}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "capture_image",
+        "description": "Take a photo with the onboard camera so you can see the surroundings.",
+        "input_schema": {"type": "object", "properties": {}}
+    }
+]
 
 # Sound Directories
 greeting_sounds_dir = "sounds/greeting_sounds"
@@ -182,6 +253,8 @@ class BotGUI:
         self.tts_queue = queue.Queue()
         self.tts_thread = None
         self.tts_active = threading.Event()
+        self.exiting = False
+        self.turn_cam_path = None
 
         # --- PIPER TTS INITIALIZATION ---
         print("[INIT] Loading Piper voice...", flush=True)
@@ -234,24 +307,26 @@ class BotGUI:
 
     # --- HELPERS ---
 
-    def extract_json_from_text(self, text):
-        try:
-            match = re.search(r'\{.*\}', text, re.DOTALL)
-            if match:
-                return json.loads(match.group(0))
-            return None
-        except: return None
-
     def safe_exit(self):
+        # Reachable from the Exit button, Escape, and atexit — run once only
+        if self.exiting:
+            return
+        self.exiting = True
         print("\n--- SHUTDOWN SEQUENCE ---", flush=True)
         self.recording_active.clear()
         self.thinking_sound_active.clear()
-        self.tts_active.clear() 
-        
+        self.tts_active.clear()
+
         self.save_chat_history()
-        
-        self.master.quit()
-        sys.exit(0) 
+
+        try:
+            sd.stop()
+        except Exception:
+            pass
+        try:
+            self.master.quit()
+        except Exception:
+            pass
         
     def exit_fullscreen(self, event=None):
         self.master.attributes('-fullscreen', False)
@@ -374,55 +449,38 @@ class BotGUI:
         self.master.after(0, update_text_stream)
 
     # =========================================================================
-    # 3. ACTION ROUTER
+    # 3. TOOL EXECUTION
     # =========================================================================
-    
-    def execute_action_and_get_result(self, action_data):
-        raw_action = action_data.get("action", "").lower().strip()
-        value = action_data.get("value") or action_data.get("query")
-        
-        VALID_TOOLS = {
-            "get_time", "search_web", "capture_image"
-        }
-        
-        ALIASES = {
-            "google": "search_web", "browser": "search_web", "news": "search_web",         
-            "search_news": "search_web", "look": "capture_image", "see": "capture_image", 
-            "check_time": "get_time"
-        }
 
-        action = ALIASES.get(raw_action, raw_action)
-        print(f"ACTION: {raw_action} -> {action}", flush=True)
+    def execute_tool(self, name, tool_input):
+        """Run a tool requested by Claude and return tool_result content."""
+        print(f"TOOL: {name} {tool_input}", flush=True)
 
-        if action not in VALID_TOOLS:
-            if value and isinstance(value, str) and len(value.split()) > 1:
-                return f"CHAT_FALLBACK::{value}"
-            return "INVALID_ACTION"
-
-        if action == "get_time":
+        if name == "get_time":
             now = datetime.datetime.now().strftime("%I:%M %p")
             return f"The current time is {now}."
-        
-        elif action == "search_web":
-            print(f"Searching web for: {value}...", flush=True)
+
+        if name == "search_web":
+            query = tool_input.get("query", "")
+            print(f"Searching web for: {query}...", flush=True)
             try:
                 # 'us-en' region is often more stable for CLI queries
                 with DDGS() as ddgs:
                     results = []
                     # 1. News search
                     try:
-                        results = list(ddgs.news(value, region='us-en', max_results=1))
-                        if results: 
+                        results = list(ddgs.news(query, region='us-en', max_results=1))
+                        if results:
                             print(f"[DEBUG] Found News: {results[0].get('title')}", flush=True)
-                    except Exception as e: 
+                    except Exception as e:
                         print(f"[DEBUG] News Search Error: {e}", flush=True)
-                    
+
                     # 2. Text fallback
                     if not results:
                         print("[DEBUG] No news found, trying text search...", flush=True)
-                        try: 
-                            results = list(ddgs.text(value, region='us-en', max_results=1))
-                            if results: 
+                        try:
+                            results = list(ddgs.text(query, region='us-en', max_results=1))
+                            if results:
                                 print(f"[DEBUG] Found Text: {results[0].get('title')}", flush=True)
                         except Exception as e:
                              print(f"[DEBUG] Text Search Error: {e}", flush=True)
@@ -432,18 +490,27 @@ class BotGUI:
                         # Safe get
                         title = r.get('title', 'No Title')
                         body = r.get('body', r.get('snippet', 'No Body'))
-                        return f"SEARCH RESULTS for '{value}':\nTitle: {title}\nSnippet: {body[:300]}"
-                    else: 
+                        return f"SEARCH RESULTS for '{query}':\nTitle: {title}\nSnippet: {body[:300]}"
+                    else:
                         print(f"[DEBUG] Search returned 0 results.", flush=True)
-                        return "SEARCH_EMPTY"
+                        return "The search returned no results."
             except Exception as e:
                 print(f"[DEBUG] Connection/Library Error: {e}", flush=True)
-                return "SEARCH_ERROR"
-        
-        elif action == "capture_image":
-             return "IMAGE_CAPTURE_TRIGGERED"
+                return "Search failed: the internet is unreachable right now."
 
-        return None
+        if name == "capture_image":
+            img_path = self.capture_image()
+            if not img_path:
+                return "Camera error: no image could be captured."
+            self.turn_cam_path = img_path
+            with open(img_path, "rb") as f:
+                img_b64 = base64.b64encode(f.read()).decode("utf-8")
+            return [{
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}
+            }]
+
+        return f"Unknown tool: {name}"
 
     # =========================================================================
     # 4. CORE LOGIC
@@ -482,7 +549,7 @@ class BotGUI:
                 
                 self.append_to_text(f"YOU: {user_text}")
                 self.interrupted.clear()
-                self.chat_and_respond(user_text, img_path=None)
+                self.chat_and_respond(user_text)
                     
         except Exception as e:
             traceback.print_exc()
@@ -514,52 +581,81 @@ class BotGUI:
 
         CHUNK_SIZE = 1280
         OWW_SAMPLE_RATE = 16000
-        
-        try:
-            device_info = sd.query_devices(kind='input')
-            native_rate = int(device_info['default_samplerate'])
-        except: native_rate = 48000
-            
-        use_resampling = (native_rate != OWW_SAMPLE_RATE)
-        input_rate = native_rate if use_resampling else OWW_SAMPLE_RATE
+
+        input_rate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
+        use_resampling = (input_rate != OWW_SAMPLE_RATE)
         input_chunk_size = int(CHUNK_SIZE * (input_rate / OWW_SAMPLE_RATE)) if use_resampling else CHUNK_SIZE
 
+        stream_args = {
+            "samplerate": input_rate,
+            "channels": 1,
+            "dtype": 'int16',
+            "blocksize": input_chunk_size,
+            "device": INPUT_DEVICE_NAME
+        }
+
         try:
-            with sd.InputStream(samplerate=input_rate, channels=1, dtype='int16', 
-                                blocksize=input_chunk_size, device=INPUT_DEVICE_NAME) as stream:
-                while True:
-                    if self.ptt_event.is_set():
-                        self.ptt_event.clear()
-                        return "PTT"
-                    
-                    rlist, _, _ = select.select([sys.stdin], [], [], 0.001)
-                    if rlist: 
-                        sys.stdin.readline()
-                        return "CLI" 
-
-                    data, _ = stream.read(input_chunk_size)
-                    audio_data = np.frombuffer(data, dtype=np.int16)
-
-                    if use_resampling:
-                         audio_data = scipy.signal.resample(audio_data, CHUNK_SIZE).astype(np.int16)
-
-                    prediction = self.oww_model.predict(audio_data)
-                    for mdl in self.oww_model.prediction_buffer.keys():
-                        if list(self.oww_model.prediction_buffer[mdl])[-1] > WAKE_WORD_THRESHOLD:
-                            self.oww_model.reset() 
-                            return "WAKE"
+            return self._listen_loop(stream_args, input_chunk_size, CHUNK_SIZE, use_resampling)
         except Exception as e:
-            print(f"Wake Word Stream Error: {e}")
-            self.ptt_event.wait()
-            return "PTT"
+            print(f"[AUDIO] Wake stream failed: {e}. Retrying with fallback settings...", flush=True)
+            try:
+                stream_args["blocksize"] = 1024
+                stream_args["latency"] = "high"
+                return self._listen_loop(stream_args, 1024, CHUNK_SIZE, True)
+            except Exception as e2:
+                print(f"[CRITICAL] Wake Word Stream Error: {e2}", flush=True)
+                self.ptt_event.wait()
+                self.ptt_event.clear()
+                return "PTT"
+
+    def _listen_loop(self, stream_args, input_chunk_size, target_chunk_size, use_resampling):
+        with sd.InputStream(**stream_args) as stream:
+            print(f"[AUDIO] Listening at {stream_args['samplerate']} Hz, block {stream_args['blocksize']}", flush=True)
+            consecutive_overflows = 0
+            while True:
+                if self.ptt_event.is_set():
+                    self.ptt_event.clear()
+                    return "PTT"
+
+                rlist, _, _ = select.select([sys.stdin], [], [], 0.001)
+                if rlist:
+                    sys.stdin.readline()
+                    return "CLI"
+
+                data, overflow = stream.read(input_chunk_size)
+                if overflow:
+                    print("!", end="", flush=True)
+                    consecutive_overflows += 1
+                    if consecutive_overflows >= 5:
+                        raise RuntimeError("Persistent audio buffer overflow")
+                else:
+                    consecutive_overflows = 0
+
+                audio_data = np.frombuffer(data, dtype=np.int16)
+                if audio_data.ndim > 1:
+                    audio_data = audio_data.flatten()
+
+                if use_resampling:
+                    # Nearest-neighbor slicing — scipy's FFT resample per 80ms
+                    # chunk overloads the Pi CPU and causes buffer overflows
+                    step = len(audio_data) / target_chunk_size
+                    indices = np.arange(0, len(audio_data), step)[:target_chunk_size].astype(int)
+                    audio_data = audio_data[indices]
+
+                # Skip inference on near-silence to save CPU
+                if np.max(np.abs(audio_data)) <= 200:
+                    continue
+
+                self.oww_model.predict(audio_data)
+                for mdl in self.oww_model.prediction_buffer.keys():
+                    if list(self.oww_model.prediction_buffer[mdl])[-1] > WAKE_WORD_THRESHOLD:
+                        self.oww_model.reset()
+                        return "WAKE"
 
     def record_voice_adaptive(self, filename="input.wav"):
         print("Recording (Adaptive)...", flush=True)
-        time.sleep(0.5) 
-        try:
-            device_info = sd.query_devices(kind='input')
-            samplerate = int(device_info['default_samplerate'])
-        except: samplerate = 44100 
+        time.sleep(0.5)
+        samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
 
         silence_threshold = 0.006
         silence_duration = 1.5
@@ -586,30 +682,39 @@ class BotGUI:
             else: silent_chunks = 0
 
         try:
-            with sd.InputStream(samplerate=samplerate, channels=1, callback=callback, 
-                                device=INPUT_DEVICE_NAME, blocksize=chunk_size): 
+            # Release any prior stream first — hardware contention freezes the Pi 5
+            sd.stop()
+            time.sleep(0.2)
+
+            with sd.InputStream(samplerate=samplerate, channels=1, callback=callback,
+                                device=INPUT_DEVICE_NAME, blocksize=chunk_size):
                 while not silence_started and recorded_chunks < max_chunks:
                     sd.sleep(int(chunk_duration * 1000))
-        except Exception as e: return None 
-        
+        except Exception as e:
+            print(f"[AUDIO ERROR] Adaptive Recording Failed: {e}", flush=True)
+            return None
+
         return self.save_audio_buffer(buffer, filename, samplerate)
 
     def record_voice_ptt(self, filename="input.wav"):
         print("Recording (PTT)...", flush=True)
         time.sleep(0.5)
-        try:
-            device_info = sd.query_devices(kind='input')
-            samplerate = int(device_info['default_samplerate'])
-        except: samplerate = 44100 
+        samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
 
         buffer = []
         def callback(indata, frames, time_info, status): buffer.append(indata.copy())
-        
+
         try:
+            # Release any prior stream first — hardware contention freezes the Pi 5
+            sd.stop()
+            time.sleep(0.2)
+
             with sd.InputStream(samplerate=samplerate, channels=1, callback=callback, device=INPUT_DEVICE_NAME):
                 while self.recording_active.is_set(): sd.sleep(50)
-        except Exception as e: return None
-            
+        except Exception as e:
+            print(f"[AUDIO ERROR] PTT Recording Failed: {e}", flush=True)
+            return None
+
         return self.save_audio_buffer(buffer, filename, samplerate)
 
     def save_audio_buffer(self, buffer, filename, samplerate=16000):
@@ -682,26 +787,18 @@ class BotGUI:
     # 5. CHAT & RESPOND
     # =========================================================================
 
-    def _build_messages(self, text, img_path=None):
-        """Build the messages list and system prompt for the Anthropic API."""
-        if img_path:
-            with open(img_path, "rb") as f:
-                img_b64 = base64.b64encode(f.read()).decode("utf-8")
-            messages = [{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
-                {"type": "text", "text": text}
-            ]}]
-        else:
-            # Combine history (skip system prompt entry) with new user message
-            history = []
-            for msg in (self.permanent_memory + self.session_memory):
-                if msg["role"] != "system":
-                    history.append(msg)
-            history.append({"role": "user", "content": text})
-            messages = history
-        return messages
+    def _history_messages(self):
+        """Chat history as Anthropic messages (skips legacy system entries)."""
+        history = []
+        for msg in (self.permanent_memory + self.session_memory):
+            if msg["role"] == "system":
+                continue
+            if not history and msg["role"] != "user":
+                continue  # API conversations must start with a user message
+            history.append(msg)
+        return history
 
-    def chat_and_respond(self, text, img_path=None):
+    def chat_and_respond(self, text):
         # Drain any stale items from a previous response
         while not self.tts_queue.empty():
             try:
@@ -718,133 +815,89 @@ class BotGUI:
             self.set_state(BotStates.IDLE, "Memory Wiped")
             return
 
-        self.set_state(BotStates.THINKING, "Thinking...", cam_path=img_path)
+        self.set_state(BotStates.THINKING, "Thinking...")
+        self.turn_cam_path = None
 
-        messages = self._build_messages(text, img_path)
+        messages = self._history_messages() + [{"role": "user", "content": text}]
 
         self.thinking_sound_active.set()
         threading.Thread(target=self._run_thinking_sound_loop, daemon=True).start()
 
-        full_response_buffer = ""
-        sentence_buffer = ""
+        full_response_text = ""
 
         try:
-            with llm_client.messages.stream(
-                model=TEXT_MODEL, messages=messages, system=SYSTEM_PROMPT,
-                max_tokens=1024, temperature=LLM_TEMPERATURE
-            ) as stream:
-                is_action_mode = False
-
-                for content in stream.text_stream:
-                    if self.interrupted.is_set(): break
-                    if not content: continue
-                    full_response_buffer += content
-
-                    if '{"' in content or "action:" in content.lower():
-                        is_action_mode = True
-                        self.thinking_sound_active.clear()
-                        continue
-
-                    if is_action_mode: continue
-
-                    self.thinking_sound_active.clear()
-                    if self.current_state != BotStates.SPEAKING:
-                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                        self.append_to_text("BOT: ", newline=False)
-
-                    self._stream_to_text(content)
-
-                    sentence_buffer += content
-                    if re.search(r'[.!?][\s\n]*$', sentence_buffer) and len(sentence_buffer.strip()) >= TTS_MIN_SENTENCE_LENGTH:
-                        clean_sentence = sentence_buffer.strip()
-                        if clean_sentence and re.search(r'[a-zA-Z0-9]', clean_sentence):
-                            self.tts_queue.put(clean_sentence)
-                        sentence_buffer = ""
-
-            if not self.interrupted.is_set() and not is_action_mode and sentence_buffer.strip():
-                clean_sentence = sentence_buffer.strip()
-                if re.search(r'[a-zA-Z0-9]', clean_sentence):
-                    self.tts_queue.put(clean_sentence)
+            for _ in range(MAX_TOOL_ROUNDS):
                 sentence_buffer = ""
+                final_message = None
 
-            if is_action_mode:
-                action_data = self.extract_json_from_text(full_response_buffer)
-                if action_data:
-                    tool_result = self.execute_action_and_get_result(action_data)
-
-                    if tool_result and tool_result.startswith("CHAT_FALLBACK::"):
-                        chat_text = tool_result.split("::", 1)[1]
-                        self.thinking_sound_active.clear()
-                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                        self.append_to_text("BOT: ", newline=False)
-                        self.append_to_text(chat_text, newline=True)
-                        self.tts_queue.put(chat_text)
-                        self.session_memory.append({"role": "assistant", "content": chat_text})
-                        self.wait_for_tts()
-                        self.set_state(BotStates.IDLE, "Ready")
-                        return
-
-                    if tool_result == "IMAGE_CAPTURE_TRIGGERED":
-                        new_img_path = self.capture_image()
-                        if new_img_path:
-                            self.chat_and_respond(text, img_path=new_img_path)
-                            return
-
-                    elif tool_result == "INVALID_ACTION":
-                        fallback_text = "I am not sure how to do that."
-                        self.thinking_sound_active.clear()
-                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                        self.append_to_text("BOT: ", newline=False)
-                        self.append_to_text(fallback_text, newline=True)
-                        self.tts_queue.put(fallback_text)
-
-                    elif tool_result == "SEARCH_EMPTY":
-                        fallback_text = "I searched, but I couldn't find any news about that."
-                        self.thinking_sound_active.clear()
-                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                        self.append_to_text("BOT: ", newline=False)
-                        self.append_to_text(fallback_text, newline=True)
-                        self.tts_queue.put(fallback_text)
-
-                    elif tool_result == "SEARCH_ERROR":
-                        fallback_text = "I cannot reach the internet right now."
-                        self.thinking_sound_active.clear()
-                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                        self.append_to_text("BOT: ", newline=False)
-                        self.append_to_text(fallback_text, newline=True)
-                        self.tts_queue.put(fallback_text)
-
-                    elif tool_result:
-                        summary_messages = [
-                            {"role": "user", "content": f"RESULT: {tool_result}\nUser Question: {text}"}
-                        ]
-
-                        self.set_state(BotStates.THINKING, "Reading...")
-                        self.thinking_sound_active.set()
-
-                        final_resp = llm_client.messages.create(
-                            model=TEXT_MODEL, messages=summary_messages,
-                            system="Summarize this result in one short sentence.",
-                            max_tokens=256, temperature=LLM_TEMPERATURE
-                        )
-                        final_text = final_resp.content[0].text
+                with llm_client.messages.stream(
+                    model=TEXT_MODEL, messages=messages, system=SYSTEM_PROMPT,
+                    tools=TOOLS, max_tokens=1024, temperature=LLM_TEMPERATURE
+                ) as stream:
+                    for content in stream.text_stream:
+                        if self.interrupted.is_set(): break
+                        if not content: continue
+                        full_response_text += content
 
                         self.thinking_sound_active.clear()
-                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
+                        if self.current_state != BotStates.SPEAKING:
+                            self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=self.turn_cam_path)
+                            self.append_to_text("BOT: ", newline=False)
 
-                        self.append_to_text("BOT: ", newline=False)
-                        self.append_to_text(final_text, newline=True)
-                        self.tts_queue.put(final_text)
-                        self.session_memory.append({"role": "assistant", "content": final_text})
-            else:
-                self.append_to_text("")
-                self.session_memory.append({"role": "assistant", "content": full_response_buffer})
+                        self._stream_to_text(content)
+
+                        sentence_buffer += content
+                        if re.search(r'[.!?][\s\n]*$', sentence_buffer) and len(sentence_buffer.strip()) >= TTS_MIN_SENTENCE_LENGTH:
+                            clean_sentence = sentence_buffer.strip()
+                            if re.search(r'[a-zA-Z0-9]', clean_sentence):
+                                self.tts_queue.put(clean_sentence)
+                            sentence_buffer = ""
+
+                    if not self.interrupted.is_set():
+                        final_message = stream.get_final_message()
+
+                if self.interrupted.is_set() or final_message is None:
+                    break
+
+                # Flush trailing text that never hit sentence-ending punctuation
+                clean_sentence = sentence_buffer.strip()
+                if clean_sentence and re.search(r'[a-zA-Z0-9]', clean_sentence):
+                    self.tts_queue.put(clean_sentence)
+
+                if final_message.stop_reason != "tool_use":
+                    break
+
+                # Execute requested tools, then loop so Claude sees the results
+                # with the full conversation context
+                messages.append({"role": "assistant", "content": final_message.content})
+                tool_results = []
+                for block in final_message.content:
+                    if block.type == "tool_use":
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": self.execute_tool(block.name, block.input)
+                        })
+                messages.append({"role": "user", "content": tool_results})
+
+                self.set_state(BotStates.THINKING, "Reading...", cam_path=self.turn_cam_path)
+                self.thinking_sound_active.set()
+                threading.Thread(target=self._run_thinking_sound_loop, daemon=True).start()
+
+            self.thinking_sound_active.clear()
+
+            if not self.interrupted.is_set():
+                self.session_memory.append({"role": "user", "content": text})
+                if full_response_text.strip():
+                    self.append_to_text("")
+                    self.session_memory.append({"role": "assistant", "content": full_response_text})
 
             self.wait_for_tts()
             self.set_state(BotStates.IDLE, "Ready")
 
         except Exception as e:
             print(f"LLM Error: {e}")
+            self.thinking_sound_active.clear()
             self.set_state(BotStates.ERROR, "Brain Freeze!")
 
     def wait_for_tts(self):
