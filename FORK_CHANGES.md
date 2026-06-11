@@ -13,7 +13,7 @@ stack with the cloud-based Anthropic API (Claude).
 | Area              | Original (Ollama)                   | Fork (Anthropic API)              |
 | ----------------- | ----------------------------------- | --------------------------------- |
 | LLM library       | `ollama` Python package             | `anthropic` Python SDK            |
-| Text model        | `gemma3:1b` (local)                 | `claude-sonnet-4-6` (cloud)       |
+| Text model        | `gemma3:1b` (local)                 | `claude-haiku-4-5` (cloud)        |
 | Vision model      | `moondream` (local, separate model) | Claude native vision (same model) |
 | Streaming         | `ollama.chat(stream=True)`          | `client.messages.stream()`        |
 | Summarization     | `ollama.chat(stream=False)`         | `client.messages.create()`        |
@@ -174,7 +174,7 @@ instead of a prebuilt binary.
 
 | Key                      | Original                          | Fork                                    |
 | ------------------------ | --------------------------------- | --------------------------------------- |
-| `text_model`             | `gemma3:1b`                       | `claude-sonnet-4-6`                     |
+| `text_model`             | `gemma3:1b`                       | `claude-haiku-4-5`                      |
 | `vision_model`           | `moondream`                       | Removed (Claude handles vision)         |
 | `voice_model`            | `piper/en_GB-semaine-medium.onnx` | `piper/en_US-bmo-medium.onnx`           |
 | `whisper_model`          | --                                | `./whisper.cpp/models/ggml-base.en.bin` |

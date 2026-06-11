@@ -48,7 +48,7 @@ Everything lives in `agent.py` — a single ~920-line script with one main class
 The agent uses the **Anthropic API** (Claude) for all LLM tasks. The `anthropic` Python SDK communicates directly with Claude's Messages API — no local inference server is needed.
 
 - **API Key**: Read from `ANTHROPIC_API_KEY` in the `.env` file (loaded via `python-dotenv`)
-- **Model**: Defaults to `claude-sonnet-4-6`. Override via `ANTHROPIC_MODEL` env var or `text_model` in `config.json`
+- **Model**: Defaults to `claude-haiku-4-5`. Override via `ANTHROPIC_MODEL` env var or `text_model` in `config.json`
 - **Streaming**: Uses `client.messages.stream()` for real-time token delivery during conversation
 - **Tool use**: Native Anthropic tool use (`tools=` parameter) — no prompt-engineered JSON protocol or output sniffing
 - **Vision**: The `capture_image` tool returns the camera photo as a base64 image block inside the `tool_result`, so vision requests keep the full conversation history
