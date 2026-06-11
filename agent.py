@@ -32,6 +32,7 @@ import warnings
 import wave
 import struct
 import queue
+import collections
 
 # Suppress harmless library warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="ddgs")
@@ -71,6 +72,7 @@ DEFAULT_CONFIG = {
     "whisper_model": "./whisper.cpp/models/ggml-base.en.bin",
     "whisper_threads": 2,
     "audio_energy_threshold": 0.002,
+    "silence_threshold": 0.006,
     "chat_memory": True,
     "camera_rotation": 0,
     "system_prompt_extras": "",
@@ -657,29 +659,47 @@ class BotGUI:
         time.sleep(0.5)
         samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
 
-        silence_threshold = 0.006
+        silence_threshold = CURRENT_CONFIG.get("silence_threshold", 0.006)
         silence_duration = 1.5
         max_record_time = 30.0
         buffer = []
         silent_chunks = 0
-        chunk_duration = 0.05 
+        chunk_duration = 0.05
         chunk_size = int(samplerate * chunk_duration)
-        
+
         num_silent_chunks = int(silence_duration / chunk_duration)
+        num_leading_silence_chunks = int(5.0 / chunk_duration)
         max_chunks = int(max_record_time / chunk_duration)
         recorded_chunks = 0
         silence_started = False
+        had_speech = False
+        volume_history = []
+        recent_volumes = collections.deque(maxlen=5)
 
         def callback(indata, frames, time_info, status):
-            nonlocal silent_chunks, recorded_chunks, silence_started
+            nonlocal silent_chunks, recorded_chunks, silence_started, had_speech
             volume_norm = np.linalg.norm(indata) / np.sqrt(len(indata))
-            buffer.append(indata.copy())  
+            buffer.append(indata.copy())
             recorded_chunks += 1
-            if recorded_chunks < 5: return 
-            if volume_norm < silence_threshold:
+            volume_history.append(volume_norm)
+            recent_volumes.append(volume_norm)
+            if recorded_chunks < 5: return
+            # Room noise often sits above the static threshold, which used to
+            # force every recording to run the full max_record_time. Track the
+            # ambient floor (20th percentile) and compare a smoothed volume
+            # against it, capped so loud early speech can't inflate the bar.
+            noise_floor = np.percentile(volume_history, 20)
+            dynamic_threshold = max(silence_threshold, min(noise_floor * 2.2, 0.015))
+            smoothed = sum(recent_volumes) / len(recent_volumes)
+            if smoothed < dynamic_threshold:
                 silent_chunks += 1
-                if silent_chunks >= num_silent_chunks: silence_started = True
-            else: silent_chunks = 0
+                # Stop 1.5s after speech ends; allow a longer pause before
+                # speech starts so slow starters aren't cut off
+                limit = num_silent_chunks if had_speech else num_leading_silence_chunks
+                if silent_chunks >= limit: silence_started = True
+            else:
+                had_speech = True
+                silent_chunks = 0
 
         try:
             # Release any prior stream first — hardware contention freezes the Pi 5
@@ -812,6 +832,7 @@ class BotGUI:
             self.permanent_memory = [{"role": "system", "content": SYSTEM_PROMPT}]
             self.save_chat_history()
             self.tts_queue.put("Okay. Memory wiped.")
+            self.wait_for_tts()
             self.set_state(BotStates.IDLE, "Memory Wiped")
             return
 
@@ -898,6 +919,9 @@ class BotGUI:
         except Exception as e:
             print(f"LLM Error: {e}")
             self.thinking_sound_active.clear()
+            # Don't reopen the mic while queued speech is still playing,
+            # or the bot records and answers its own voice
+            self.wait_for_tts()
             self.set_state(BotStates.ERROR, "Brain Freeze!")
 
     def wait_for_tts(self):
@@ -989,11 +1013,53 @@ class BotGUI:
     def _run_thinking_sound_loop(self):
         time.sleep(0.5)
         while self.thinking_sound_active.is_set():
+            # Thinking sounds are voice clips — never play one while TTS is
+            # speaking or has speech queued, or it sounds like two voices
+            if self.tts_active.is_set() or not self.tts_queue.empty():
+                time.sleep(0.1)
+                continue
             sound = self.get_random_sound(thinking_sounds_dir)
-            if sound: self.play_sound(sound)
+            if sound: self._play_clip_interruptible(sound)
             for _ in range(50):
                 if not self.thinking_sound_active.is_set(): return
                 time.sleep(0.1)
+
+    def _play_clip_interruptible(self, file_path):
+        # Like play_sound, but cuts the clip as soon as thinking ends or TTS
+        # speech starts. All sd.play/sd.stop calls stay on this thread —
+        # stopping another thread's playback crashes PortAudio.
+        if not file_path or not os.path.exists(file_path): return
+        try:
+            with wave.open(file_path, 'rb') as wf:
+                file_sr = wf.getframerate()
+                data = wf.readframes(wf.getnframes())
+                audio = np.frombuffer(data, dtype=np.int16)
+
+            playback_rate = file_sr
+            try:
+                sd.check_output_settings(device=None, samplerate=file_sr)
+            except Exception:
+                try:
+                    device_info = sd.query_devices(kind='output')
+                    playback_rate = int(device_info['default_samplerate'])
+                except Exception:
+                    playback_rate = 48000
+                num_samples = int(len(audio) * (playback_rate / file_sr))
+                audio = scipy.signal.resample(audio, num_samples).astype(np.int16)
+
+            sd.play(audio, playback_rate)
+            remaining = len(audio) / playback_rate
+            while remaining > 0:
+                # Let the clip finish naturally; only cut it if speech is
+                # actually queued or playing, so voices never overlap
+                if self.tts_active.is_set() or not self.tts_queue.empty():
+                    sd.stop()
+                    return
+                time.sleep(0.05)
+                remaining -= 0.05
+            sd.wait()
+        except Exception:
+            pass
 
     def get_random_sound(self, directory):
         if os.path.exists(directory):
