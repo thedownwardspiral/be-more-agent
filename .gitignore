@@ -33,6 +33,10 @@ llama-swap
 # !wakeword.onnx
 
 # --- User Configuration & Memory ---
+# Claude Code per-project memory and session state (local working notes,
+# contains local paths and session IDs — not project source)
+.claude/projects/
+
 # Keep chat history local (Privacy)
 memory.json
 chat_memory.json
