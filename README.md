@@ -51,14 +51,15 @@ sudo raspi-config
 be-more-agent/
 ├── agent.py                   # The main brain script
 ├── setup.sh                   # Auto-installer script
-├── start_agent.sh             # Launch script (activates .bmo venv, runs agent.py)
+├── start_agent.sh             # Launch script (runs agent.py via .venv)
 ├── be-more-agent.desktop      # Autostart template (installed to ~/.config/autostart/)
 ├── .env                       # API keys (gitignored — copy from example.env)
 ├── example.env                # Template for .env
 ├── config.json                # User settings (Model, Prompt, Hardware)
 ├── wakeword.onnx              # OpenWakeWord model (The "Ear")
 ├── memory.json                # Conversation history
-├── requirements.txt           # Python dependencies
+├── pyproject.toml             # Python dependencies (managed by uv)
+├── uv.lock                    # Locked dependency versions
 ├── whisper.cpp/               # Speech-to-Text engine
 ├── piper/                     # Piper TTS voice models (.onnx + .onnx.json)
 ├── sounds/                    # Sound effects folder
@@ -93,7 +94,7 @@ cd be-more-agent
 chmod +x setup.sh
 ./setup.sh
 ```
-*The setup script will install system libraries, create necessary folders, set up the `.bmo` Python virtual environment (including the `piper-tts` and `anthropic` SDKs and other dependencies from `requirements.txt`), download a Piper voice via `python -m piper.download_voices`, build whisper.cpp, and install a desktop autostart entry so the agent launches with the desktop session (remove `~/.config/autostart/be-more-agent.desktop` to disable).*
+*The setup script will install system libraries (and `uv` itself, if missing), create necessary folders, set up the `.venv` Python virtual environment via `uv sync` (including the `piper-tts` and `anthropic` SDKs and the rest of the locked dependency set from `pyproject.toml` / `uv.lock`), download a Piper voice via `python -m piper.download_voices`, build whisper.cpp, and install a desktop autostart entry so the agent launches with the desktop session (remove `~/.config/autostart/be-more-agent.desktop` to disable).*
 
 ### 3. Configure Your API Key
 ```bash
@@ -109,9 +110,10 @@ The setup script downloads a default wake word ("Hey Jarvis"). To use your own:
 
 ### 5. Run the Agent
 ```bash
-source .bmo/bin/activate
-python agent.py
+uv run agent.py
 ```
+
+<sub>(or the classic form: `source .venv/bin/activate` then `python agent.py`)</sub>
 
 The GUI is designed for the Raspberry Pi's DSI display interface (800x480). The script automatically sets `DISPLAY=:0` so it renders to the DSI screen even when launched via SSH or a systemd service. If you need to target a different display, set the `DISPLAY` environment variable before launching.
 
@@ -142,7 +144,7 @@ You can modify the hardware behavior and personality in `config.json`:
     "text_model": "claude-haiku-4-5",
     "voice_model": "piper/en_US-bmo-medium.onnx",
     "whisper_model": "./whisper.cpp/models/ggml-base.en.bin",
-    "whisper_threads": 2,
+    "whisper_threads": 3,
     "audio_energy_threshold": 0.002,
     "chat_memory": true,
     "camera_rotation": 0,
@@ -157,7 +159,7 @@ You can modify the hardware behavior and personality in `config.json`:
 | `text_model` | Anthropic model name (overridden by `ANTHROPIC_MODEL` env var if set) |
 | `voice_model` | Path to Piper TTS voice `.onnx` file (with sibling `.onnx.json`, as written by `python -m piper.download_voices`) |
 | `whisper_model` | Path to whisper.cpp model file (default: `ggml-base.en.bin`) |
-| `whisper_threads` | Number of CPU threads for whisper transcription (default: `2`) |
+| `whisper_threads` | Number of CPU threads for whisper transcription (default: `3`) |
 | `audio_energy_threshold` | RMS energy below which audio is skipped without transcription (default: `0.002`) |
 | `chat_memory` | Enable/disable persistent chat history |
 | `camera_rotation` | Rotate camera image (0, 90, 180, 270) |
@@ -180,9 +182,9 @@ This software is a generic framework. You can give it a new personality by repla
 
 * **`couldn't connect to display ":0"` error:** The Pi must be running a desktop environment (X11 or Wayland). If you installed Raspberry Pi OS Lite (server/headless), you need to install `lightdm` and configure desktop autologin via `sudo raspi-config` — see [Display Requirements](#️-display-requirements). If running over SSH, ensure the desktop is already active on the Pi. You can override the target display with `DISPLAY=:1 python agent.py` if needed.
 * **"AuthenticationError" or API key errors:** Ensure your `.env` file exists and contains a valid `ANTHROPIC_API_KEY`. Copy from `example.env` if needed.
-* **"No search library found":** If web search fails, ensure you are in the `.bmo` virtual environment and `ddgs` is installed via pip.
+* **"No search library found":** If web search fails, ensure you are in the `.venv` virtual environment and `ddgs` is installed (`uv sync`).
 * **Shutdown Errors:** When you exit the script (Ctrl+C), you might see `Expression 'alsa_snd_pcm_mmap_begin' failed`. **This is normal.** It just means the audio stream was cut off mid-sample. It does not affect the functionality.
-* **Audio Glitches:** If the voice sounds fast or slow, the script attempts to auto-detect sample rates. Ensure your `config.json` points to a valid `.onnx` voice model in the `piper/` folder (with its sibling `.onnx.json` next to it). To switch voices, run `python -m piper.download_voices --data-dir piper <voice-name>` from within the `.bmo` venv.
+* **Audio Glitches:** If the voice sounds fast or slow, the script attempts to auto-detect sample rates. Ensure your `config.json` points to a valid `.onnx` voice model in the `piper/` folder (with its sibling `.onnx.json` next to it). To switch voices, run `uv run python -m piper.download_voices --data-dir piper <voice-name>`.
 * **Choppy/Fragmented Speech:** If the TTS output sounds broken into tiny fragments, the `TTS_MIN_SENTENCE_LENGTH` constant in `agent.py` (default: 80 characters) controls how much text is buffered before being sent to Piper. Increase it for longer, smoother utterances.
 
 ## 📄 License

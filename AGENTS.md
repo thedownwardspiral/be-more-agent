@@ -9,7 +9,7 @@ Be More Agent is a single-file Python application (`agent.py`) that turns a Rasp
 ## Quick Start
 
 ```bash
-# Setup (installs system deps, .bmo venv with piper-tts + anthropic SDK,
+# Setup (installs uv + system deps, .venv with piper-tts + anthropic SDK,
 # downloads a Piper voice into piper/, builds whisper.cpp)
 chmod +x setup.sh && ./setup.sh
 
@@ -18,7 +18,7 @@ cp example.env .env
 # Edit .env and set ANTHROPIC_API_KEY
 
 # Run (auto-targets DSI display via DISPLAY=:0)
-source .bmo/bin/activate && python agent.py
+uv run agent.py
 ```
 
 There are no tests or linting configured.
@@ -30,9 +30,10 @@ There are no tests or linting configured.
 | `agent.py` | Entire application — single-file tkinter GUI + LLM agent (Piper voice loaded in-process via `PiperVoice.load()`) |
 | `config.json` | User-facing settings (model name, voice, camera, system prompt) |
 | `example.env` | Template for `.env` file (API keys) |
-| `setup.sh` | One-shot installer — system deps, `.bmo` venv (incl. `piper-tts`), downloads a Piper voice, builds whisper.cpp, installs desktop autostart |
-| `requirements.txt` | Python dependencies (includes `piper-tts`) |
-| `start_agent.sh` | Launch script — activates `.bmo` venv and execs `agent.py` |
+| `setup.sh` | One-shot installer — uv, system deps, `.venv` via `uv sync` (incl. `piper-tts`), downloads a Piper voice, builds whisper.cpp, installs desktop autostart |
+| `pyproject.toml` | Python dependencies (includes `piper-tts`), managed by uv |
+| `uv.lock` | Locked, reproducible dependency versions |
+| `start_agent.sh` | Launch script — execs `agent.py` via `.venv` |
 | `be-more-agent.desktop` | Autostart template; `setup.sh` substitutes the repo path and copies it to `~/.config/autostart/` |
 
 ## Architecture

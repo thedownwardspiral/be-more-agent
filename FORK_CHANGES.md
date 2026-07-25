@@ -70,11 +70,11 @@ the lifetime of the agent. No subprocess, no separate server.
 
 ### Dependencies and setup
 
-- `requirements.txt` adds `piper-tts`.
+- `pyproject.toml` adds `piper-tts`.
 - `setup.sh` no longer downloads the prebuilt `piper_linux_aarch64`
   binary; instead it runs
   `python -m piper.download_voices --data-dir piper en_US-bmo-medium`
-  inside the `.bmo` venv to fetch the voice `.onnx` + `.onnx.json` into
+  inside the `.venv` to fetch the voice `.onnx` + `.onnx.json` into
   `piper/`.
 
 ### Agent-side changes
@@ -142,7 +142,7 @@ testing.
 | `CLAUDE.md`         | Project context for Claude Code              |
 | `AGENTS.md`         | Project context for AI coding agents         |
 
-### `requirements.txt`
+### Dependency manifest (`requirements.txt` → `pyproject.toml`)
 
 | Original            | Fork            |
 | ------------------- | --------------- |
@@ -158,7 +158,10 @@ instead of a prebuilt binary.
 
 ### `setup.sh`
 
-- **Virtual environment**: Renamed from `venv` to `.bmo`.
+- **Virtual environment**: `venv` + `pip install -r requirements.txt`
+  replaced with [uv](https://docs.astral.sh/uv/) — `setup.sh` installs `uv`
+  if missing and runs `uv sync`, which creates `.venv/` from
+  `pyproject.toml` and the locked versions in `uv.lock`.
 - **Desktop environment check**: Added a pre-flight check for a display
   manager (`lightdm`, `gdm3`, or `sddm`) with a warning if none is
   found.
@@ -259,7 +262,7 @@ changes were ported back:
 
 ## Desktop Autostart
 
-`start_agent.sh` (activates the `.bmo` venv and execs `agent.py`) and a
+`start_agent.sh` (execs `agent.py` via `.venv`) and a
 `be-more-agent.desktop` template were added, mirroring upstream's launch
 story. `setup.sh` substitutes the repo path into the template and installs
 it to `~/.config/autostart/`, replacing the systemd unit that was retired

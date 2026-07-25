@@ -44,17 +44,19 @@ mkdir -p faces/error
 mkdir -p faces/warmup
 
 # 3. Install Python Libraries (Piper TTS now ships as a Python wheel)
-echo -e "${YELLOW}[3/8] Installing Python Libraries...${NC}"
-if [ ! -d ".bmo" ]; then
-    python3 -m venv .bmo
+echo -e "${YELLOW}[3/8] Installing Python Libraries (uv)...${NC}"
+if ! command -v uv &>/dev/null; then
+    echo -e "${YELLOW}Installing uv...${NC}"
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    # The installer drops uv in ~/.local/bin, which may not be on PATH yet.
+    export PATH="$HOME/.local/bin:$PATH"
 fi
-source .bmo/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
+# Creates .venv/ and installs the locked dependency set from uv.lock.
+uv sync
 
 # 4. Download Voice Model via piper1-gpl's downloader
 echo -e "${YELLOW}[4/8] Downloading Voice Model...${NC}"
-python -m piper.download_voices --data-dir piper en_US-bmo-medium
+uv run python -m piper.download_voices --data-dir piper en_US-bmo-medium
 
 # 5. Build whisper.cpp and download model
 echo -e "${YELLOW}[5/8] Building whisper.cpp...${NC}"
@@ -85,5 +87,5 @@ echo -e "${YELLOW}[8/8] Installing desktop autostart entry...${NC}"
 mkdir -p "$HOME/.config/autostart"
 sed "s|__BASE_DIR__|$(pwd)|g" be-more-agent.desktop > "$HOME/.config/autostart/be-more-agent.desktop"
 
-echo -e "${GREEN}✨ Setup Complete! Run 'source .bmo/bin/activate' then 'python agent.py'${NC}"
+echo -e "${GREEN}✨ Setup Complete! Run 'uv run agent.py' (or 'source .venv/bin/activate' then 'python agent.py')${NC}"
 echo -e "${GREEN}   The agent will also autostart with the desktop session (remove ~/.config/autostart/be-more-agent.desktop to disable).${NC}"

@@ -9,7 +9,7 @@ Be More Agent is a single-file Python application (`agent.py`) that turns a Rasp
 ## Running the Project
 
 ```bash
-# First-time setup (installs system deps, .bmo venv with piper-tts + anthropic SDK,
+# First-time setup (installs uv + system deps, .venv with piper-tts + anthropic SDK,
 # downloads a Piper voice into piper/, builds whisper.cpp)
 chmod +x setup.sh
 ./setup.sh
@@ -19,8 +19,7 @@ cp example.env .env
 # Edit .env and add your ANTHROPIC_API_KEY
 
 # Run the agent (auto-targets DSI display via DISPLAY=:0)
-source .bmo/bin/activate
-python agent.py
+uv run agent.py
 ```
 
 There are no tests or linting configured in this project.
@@ -55,8 +54,8 @@ The agent uses the **Anthropic API** (Claude) for all LLM tasks. The `anthropic`
 
 ## External Tool Chain (not in repo, installed by setup.sh)
 
-- **whisper.cpp** — Speech-to-text at `./whisper.cpp/build/bin/whisper-cli`. Model and thread count configurable via `config.json` (`whisper_model`, `whisper_threads`). Defaults to `ggml-base.en.bin` with 2 threads to balance speed and CPU headroom.
-- **Piper TTS** — Text-to-speech via the [`piper-tts`](https://github.com/OHF-Voice/piper1-gpl) Python package (installed into the `.bmo` venv from `requirements.txt`). Voice `.onnx` + `.onnx.json` files live in `piper/`, downloaded by `python -m piper.download_voices --data-dir piper <voice-name>` during setup. The model is loaded once at agent startup via `PiperVoice.load()` and stays resident in-process — no subprocess, no separate server.
+- **whisper.cpp** — Speech-to-text at `./whisper.cpp/build/bin/whisper-cli`. Model and thread count configurable via `config.json` (`whisper_model`, `whisper_threads`). Defaults to `ggml-base.en.bin` with 3 threads. Benchmarked on a Pi 5: whisper pads every input to a 30s window, so transcription latency is fixed regardless of utterance length. `base.en` is the accuracy/speed sweet spot — `tiny.en` misrecognizes short questions outright, and `small.en` costs ~2x for no content gain. Threads scale 6.7s/3.5s/2.5s/2.5s at 1/2/3/4; the 4th thread buys ~40ms while starving the tkinter and audio-callback threads, so 3 is the cap.
+- **Piper TTS** — Text-to-speech via the [`piper-tts`](https://github.com/OHF-Voice/piper1-gpl) Python package (installed into `.venv` from `pyproject.toml`). Voice `.onnx` + `.onnx.json` files live in `piper/`, downloaded by `python -m piper.download_voices --data-dir piper <voice-name>` during setup. The model is loaded once at agent startup via `PiperVoice.load()` and stays resident in-process — no subprocess, no separate server.
 - **OpenWakeWord** — Wake word detection from `wakeword.onnx`
 
 ## Piper TTS
@@ -75,7 +74,7 @@ The agent uses the **Anthropic API** (Claude) for all LLM tasks. The `anthropic`
 
 The target display is the Raspberry Pi's DSI touchscreen interface (800x480). The script sets `os.environ.setdefault("DISPLAY", ":0")` at the top of `agent.py` before any tkinter imports, ensuring the GUI renders to the DSI screen regardless of launch context (local terminal, SSH, or systemd service). Users can override by setting `DISPLAY` before running.
 
-`setup.sh` installs a desktop autostart entry: it substitutes the repo path into `be-more-agent.desktop` and copies it to `~/.config/autostart/`, which launches `start_agent.sh` (activates the `.bmo` venv, execs `agent.py`) when the desktop session starts. Remove that file to disable autostart.
+`setup.sh` installs a desktop autostart entry: it substitutes the repo path into `be-more-agent.desktop` and copies it to `~/.config/autostart/`, which launches `start_agent.sh` (execs `agent.py` via `.venv`) when the desktop session starts. Remove that file to disable autostart.
 
 ## Audio Handling
 

@@ -1,3 +1,3 @@
 # Memory Index
 
-- [feedback_venv_path.md](feedback_venv_path.md) — Project venv is `.bmo/`, not `venv/`
+- [feedback_venv_path.md](feedback_venv_path.md) — Project uses `uv` + `.venv/` (migrated from `.bmo/`)

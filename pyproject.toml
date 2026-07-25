@@ -1,0 +1,30 @@
+[project]
+name = "be-more-agent"
+version = "0.1.0"
+description = "A Raspberry Pi conversational AI agent with wake word, whisper.cpp STT, Claude, and Piper TTS"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "sounddevice",
+    "numpy",
+    "scipy",
+    # 0.5.0+ requires tflite-runtime on Linux, which publishes no wheel for
+    # CPython 3.13 / aarch64. pip silently backtracked to 0.4.0; uv errors, so
+    # pin the boundary explicitly. Revisit if tflite-runtime ships cp313 wheels.
+    "openwakeword<0.5",
+    "onnxruntime",
+    "anthropic",
+    "python-dotenv",
+    "ddgs",
+    "Pillow",
+    "piper-tts",
+]
+
+# agent.py is a single top-level script, not an installable package.
+[tool.uv]
+package = false
+
+# The GUI needs tkinter, which comes from the apt package python3-tk installed by
+# setup.sh — that only equips the system interpreter. Forbid uv from silently
+# downloading a managed CPython, which would build a .venv with no working Tk.
+python-preference = "only-system"
