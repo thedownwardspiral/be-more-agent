@@ -64,15 +64,19 @@ CONFIG_FILE = "config.json"
 MEMORY_FILE = "memory.json"
 BMO_IMAGE_FILE = "current_image.jpg"
 WAKE_WORD_MODEL = "./wakeword.onnx"
-WAKE_WORD_THRESHOLD = 0.5
 
 DEFAULT_CONFIG = {
     "text_model": "claude-haiku-4-5",
     "voice_model": "piper/en_US-bmo-medium.onnx",
     "whisper_model": "./whisper.cpp/models/ggml-base.en.bin",
-    "whisper_threads": 2,
+    "whisper_threads": 3,
     "audio_energy_threshold": 0.002,
     "silence_threshold": 0.006,
+    # Raise either of these only if you observe genuine false wakes; 0.5/1 is the
+    # long-standing openwakeword default. "consecutive" requires N frames in a row
+    # over threshold, which suppresses single-frame noise spikes.
+    "wake_word_threshold": 0.5,
+    "wake_word_consecutive": 1,
     "chat_memory": True,
     "camera_rotation": 0,
     "system_prompt_extras": "",
@@ -99,6 +103,24 @@ def load_config():
 
 CURRENT_CONFIG = load_config()
 TEXT_MODEL = os.environ.get("ANTHROPIC_MODEL", CURRENT_CONFIG["text_model"])
+WAKE_WORD_THRESHOLD = CURRENT_CONFIG["wake_word_threshold"]
+WAKE_WORD_CONSECUTIVE = max(1, int(CURRENT_CONFIG["wake_word_consecutive"]))
+
+# whisper.cpp prefixes every segment with "[hh:mm:ss.mmm --> hh:mm:ss.mmm]".
+# Match only that prefix so bracketed non-speech markers survive intact.
+WHISPER_TIMESTAMP_RE = re.compile(r"^\s*\[[\d:.]+\s*-->\s*[\d:.]+\]\s*")
+
+# Whisper annotates non-speech audio instead of returning nothing: "[BLANK_AUDIO]",
+# "(wind blowing)", "*coughs*". Strip these; if nothing is left, there was no speech.
+NON_SPEECH_MARKER_RE = re.compile(r"\[[^\]]*\]|\([^)]*\)|\*[^*]*\*")
+
+# Well-known whisper hallucinations on silent/near-silent input. Only ever compared
+# against the *entire* transcript, so a real sentence containing these is unaffected.
+WHISPER_HALLUCINATIONS = {
+    "you", "thank you", "thanks for watching", "thank you for watching",
+    "bye", "bye bye", "okay", "oh", "so", "um", "uh", "hmm", "mm",
+    "please subscribe", "subtitles by the amara.org community",
+}
 
 # Anthropic client — reads ANTHROPIC_API_KEY from environment / .env
 llm_client = anthropic.Anthropic()
@@ -614,15 +636,26 @@ class BotGUI:
         with sd.InputStream(**stream_args) as stream:
             print(f"[AUDIO] Listening at {stream_args['samplerate']} Hz, block {stream_args['blocksize']}", flush=True)
             consecutive_overflows = 0
+            try:
+                stdin_is_interactive = sys.stdin is not None and sys.stdin.isatty()
+            except (ValueError, AttributeError):
+                stdin_is_interactive = False
             while True:
                 if self.ptt_event.is_set():
                     self.ptt_event.clear()
                     return "PTT"
 
-                rlist, _, _ = select.select([sys.stdin], [], [], 0.001)
-                if rlist:
-                    sys.stdin.readline()
-                    return "CLI"
+                # Only poll stdin when it is an interactive terminal. Under the
+                # desktop autostart / systemd there is no tty, and select() reports
+                # an EOF stdin as permanently readable — which fired a bogus "CLI"
+                # trigger on every pass of this loop.
+                if stdin_is_interactive:
+                    rlist, _, _ = select.select([sys.stdin], [], [], 0.001)
+                    if rlist:
+                        if sys.stdin.readline() == "":
+                            stdin_is_interactive = False  # EOF: stop polling
+                        else:
+                            return "CLI"
 
                 data, overflow = stream.read(input_chunk_size)
                 if overflow:
@@ -650,7 +683,15 @@ class BotGUI:
 
                 self.oww_model.predict(audio_data)
                 for mdl in self.oww_model.prediction_buffer.keys():
-                    if list(self.oww_model.prediction_buffer[mdl])[-1] > WAKE_WORD_THRESHOLD:
+                    scores = list(self.oww_model.prediction_buffer[mdl])
+                    # Require several consecutive frames over threshold. A single
+                    # noise spike can clear the bar for one 80ms frame; a real wake
+                    # word stays above it for the length of the utterance.
+                    recent = scores[-WAKE_WORD_CONSECUTIVE:]
+                    if len(recent) < WAKE_WORD_CONSECUTIVE:
+                        continue
+                    if all(score > WAKE_WORD_THRESHOLD for score in recent):
+                        print(f"[WAKE] {mdl} triggered ({max(recent):.2f})", flush=True)
                         self.oww_model.reset()
                         return "WAKE"
 
@@ -764,6 +805,29 @@ class BotGUI:
             print(f"[AUDIO] Energy check failed: {e}", flush=True)
             return True  # transcribe on error to be safe
 
+    def _is_speech(self, transcription):
+        """False for whisper's non-speech annotations and silence hallucinations.
+
+        A false wake word fire on room noise used to reach the LLM as "(wind
+        blowing)" and get answered out loud. Whisper is already telling us there
+        was no speech — honour it instead of forwarding it to Claude.
+        """
+        if not transcription:
+            return False
+
+        # Drop bracketed annotations; if nothing survives, it was pure non-speech.
+        residue = NON_SPEECH_MARKER_RE.sub("", transcription)
+        if not re.search(r"[A-Za-z0-9]", residue):
+            print("[AUDIO] Non-speech audio — ignoring.", flush=True)
+            return False
+
+        normalized = re.sub(r"[^a-z0-9 ]", "", residue.lower()).strip()
+        if normalized in WHISPER_HALLUCINATIONS:
+            print(f"[AUDIO] Silence hallucination '{transcription}' — ignoring.", flush=True)
+            return False
+
+        return True
+
     def transcribe_audio(self, filename):
         if not self._check_audio_energy(filename):
             print("[AUDIO] Skipping transcription — audio too quiet.", flush=True)
@@ -771,7 +835,7 @@ class BotGUI:
 
         print("Transcribing...", flush=True)
         whisper_model = CURRENT_CONFIG.get("whisper_model", "./whisper.cpp/models/ggml-base.en.bin")
-        whisper_threads = str(CURRENT_CONFIG.get("whisper_threads", 2))
+        whisper_threads = str(CURRENT_CONFIG.get("whisper_threads", 3))
         try:
             result = subprocess.run(
                 ["./whisper.cpp/build/bin/whisper-cli", "-m", whisper_model, "-l", "en", "-t", whisper_threads, "-f", filename],
@@ -780,10 +844,11 @@ class BotGUI:
             transcription_lines = result.stdout.strip().split('\n')
             if transcription_lines and transcription_lines[-1].strip():
                 last_line = transcription_lines[-1].strip()
-                if ']' in last_line: transcription = last_line.split("]")[1].strip()
-                else: transcription = last_line
+                transcription = WHISPER_TIMESTAMP_RE.sub("", last_line).strip()
             else: transcription = ""
             print(f"Heard: '{transcription}'", flush=True)
+            if not self._is_speech(transcription):
+                return ""
             return transcription.strip()
         except Exception as e:
             print(f"Transcription Error: {e}")
