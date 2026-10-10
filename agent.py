@@ -43,12 +43,14 @@ class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
             pass  # not our file; still usable
         return os.fdopen(fd, self.mode, encoding=self.encoding, errors=self.errors)
 
+LOG_BACKUP_COUNT = 3  # agent.log.1 .. agent.log.3
+
 def _setup_logging():
     handlers = [logging.StreamHandler(sys.stdout)]
     file_error = None
     try:
         handlers.append(_PrivateRotatingFileHandler(
-            BASE_DIR / "agent.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8"))
+            BASE_DIR / "agent.log", maxBytes=1_000_000, backupCount=LOG_BACKUP_COUNT, encoding="utf-8"))
     except OSError as e:
         file_error = e
     # Root at WARNING so library warnings land in the log too, without the
@@ -113,8 +115,10 @@ CONFIG_FILE = "config.json"
 MEMORY_FILE = "memory.json"
 BMO_IMAGE_FILE = "current_image.jpg"  # written inside the per-run temp dir
 WAKE_WORD_MODEL = "./wakeword.onnx"
-# Files holding the API key or conversation transcripts: owner read/write only
-PRIVATE_FILES = [".env", MEMORY_FILE, "agent.log"]
+# Files holding the API key or conversation transcripts: owner read/write only.
+# Includes the rotated log backups, which may predate the 0600 handler.
+PRIVATE_FILES = [".env", MEMORY_FILE, "agent.log"] + \
+    [f"agent.log.{i}" for i in range(1, LOG_BACKUP_COUNT + 1)]
 
 DEFAULT_CONFIG = {
     "text_model": "claude-haiku-4-5",
@@ -129,6 +133,9 @@ DEFAULT_CONFIG = {
     "wake_word_threshold": 0.5,
     "wake_word_consecutive": 1,
     "chat_memory": True,
+    # Write what you said ("Heard: ...") and what the bot said ("[PIPER
+    # SPEAKING] ...") to agent.log. false logs only their length, at DEBUG.
+    "log_transcripts": True,
     "camera_rotation": 0,
     "system_prompt_extras": "",
     "input_device": None,
@@ -272,6 +279,14 @@ WAKE_WORD_THRESHOLD = CURRENT_CONFIG["wake_word_threshold"]
 WAKE_WORD_CONSECUTIVE = CURRENT_CONFIG["wake_word_consecutive"]
 MAX_HISTORY_MESSAGES = CURRENT_CONFIG["max_history_messages"]
 CHAT_MEMORY_ENABLED = CURRENT_CONFIG["chat_memory"]
+LOG_TRANSCRIPTS = CURRENT_CONFIG["log_transcripts"]
+
+def log_transcript(prefix, text):
+    """Log a line carrying the user's or the bot's words, honouring log_transcripts."""
+    if LOG_TRANSCRIPTS:
+        log.info(f"{prefix} '{text}'")
+    else:
+        log.debug(f"{prefix} <redacted, {len(text)} chars>")
 
 # Optional request parameters, passed to every Claude call. A null config value
 # leaves the parameter out so the model's own default applies.
@@ -300,22 +315,67 @@ WHISPER_TIMESTAMP_RE = re.compile(r"^\s*\[[\d:.]+\s*-->\s*[\d:.]+\]\s*")
 # "(wind blowing)", "*coughs*". Strip these; if nothing is left, there was no speech.
 NON_SPEECH_MARKER_RE = re.compile(r"\[[^\]]*\]|\([^)]*\)|\*[^*]*\*")
 
+def normalize_words(text):
+    """Lowercase, drop punctuation, collapse whitespace: "What's THIS?" -> "whats this"."""
+    return " ".join(re.sub(r"[^\w\s]", "", text.lower()).split())
+
 # Well-known whisper hallucinations on silent/near-silent input. Only ever compared
 # against the *entire* transcript, so a real sentence containing these is unaffected.
-WHISPER_HALLUCINATIONS = {
+# Stored normalized ("amara.org" -> "amaraorg") to match normalize_words() output.
+WHISPER_HALLUCINATIONS = {normalize_words(p) for p in (
     "you", "thank you", "thanks for watching", "thank you for watching",
     "bye", "bye bye", "okay", "oh", "so", "um", "uh", "hmm", "mm",
     "please subscribe", "subtitles by the amara.org community",
-}
+)}
+
+def is_valid_memory(history):
+    """True if history is a well-formed memory.json: a system entry first, then
+    user/assistant entries only, each with non-empty string content."""
+    if not isinstance(history, list) or not history:
+        return False
+    for i, m in enumerate(history):
+        if not isinstance(m, dict):
+            return False
+        if m.get("role") not in ("system", "user", "assistant"):
+            return False
+        if (m["role"] == "system") != (i == 0):
+            return False  # system first, and only first
+        content = m.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return False
+    return True
 
 # Memory wipe fires only when the *whole* utterance is the command, so
 # "don't forget everything" never wipes anything. Matched after normalize.
 MEMORY_WIPE_RE = re.compile(r"^(?:please\s+)?(?:forget everything|reset (?:your )?memory)(?:\s+please)?$")
 
-# Anthropic client — reads ANTHROPIC_API_KEY from environment / .env.
-# The SDK default timeout is 10 minutes; 60s bounds each request (and each
-# idle gap between streamed chunks) so a dead network can't hang a turn.
-llm_client = anthropic.Anthropic(timeout=60.0, max_retries=2)
+class MissingAPIKeyError(RuntimeError):
+    pass
+
+# Anthropic client — reads ANTHROPIC_API_KEY from environment / .env. Built on
+# first use by get_llm_client(), not at import, so a missing key shows up on the
+# ERROR face instead of killing the process before the GUI exists.
+llm_client = None
+
+def get_llm_client():
+    global llm_client
+    if llm_client is None:
+        try:
+            # The SDK default timeout is 10 minutes; 60s bounds each request (and
+            # each idle gap between streamed chunks). With one retry, a black-holed
+            # network stalls a turn for at most 2 attempts x 60s plus backoff,
+            # about 2 minutes, during which wake word and PTT are not listened to.
+            client = anthropic.Anthropic(timeout=60.0, max_retries=1)
+        except anthropic.AnthropicError as e:
+            raise MissingAPIKeyError(f"Could not create the Anthropic client: {e}. "
+                                     "Set ANTHROPIC_API_KEY in .env") from e
+        # Recent SDKs don't raise here without a key; the first request then fails
+        # with an opaque TypeError. Check up front for a clear message instead.
+        if (getattr(client, "api_key", None) is None and getattr(client, "auth_token", None) is None
+                and getattr(client, "credentials", None) is None):
+            raise MissingAPIKeyError("ANTHROPIC_API_KEY is not set. Add it to .env")
+        llm_client = client
+    return llm_client
 
 def resolve_input_device(config):
     requested = config.get("input_device")
@@ -426,10 +486,6 @@ TOOLS = [
     }
 ]
 
-def normalize_words(text):
-    """Lowercase, drop punctuation, collapse whitespace: "What's THIS?" -> "whats this"."""
-    return " ".join(re.sub(r"[^\w\s]", "", text.lower()).split())
-
 def build_trigger_re(phrases):
     """Whole-word/phrase matcher for normalized text, or None if phrases is empty."""
     phrases = sorted({p for p in map(normalize_words, phrases) if p}, key=len, reverse=True)
@@ -447,8 +503,12 @@ TOOLS_WITHOUT_CAMERA = [t for t in TOOLS if t["name"] != "capture_image"]
 # characters. Applied in order: "$12.50" must match before a bare "$".
 TTS_SYMBOL_SUBS = [
     (re.compile(r"[‘’ʼ]"), "'"),  # curly apostrophes -> '
-    (re.compile(r"\$\s*(\d(?:[\d,]*\d)?(?:\.\d+)?)"), r"\1 dollars"),
+    # "$5 million" -> "5 million dollars", not "5 dollars million"
+    (re.compile(r"\$\s*(\d(?:[\d,]*\d)?(?:\.\d+)?)(\s*(?i:thousand|million|billion|trillion|k|m|bn))?\b"),
+     r"\1\2 dollars"),
     (re.compile(r"\$"), " dollars "),
+    # Dashes are stripped below; read them as a pause instead of gluing words
+    (re.compile(r"\s*[–—]\s*"), ", "),
     (re.compile(r"%"), " percent"),
     (re.compile(r"\s*°\s*C\b"), " degrees celsius"),
     (re.compile(r"\s*°\s*F\b"), " degrees fahrenheit"),
@@ -493,17 +553,10 @@ class BotGUI:
         master.bind('<space>', self.handle_speaking_interrupt)
 
         # Per-run scratch space for input.wav and camera photos; removed in safe_exit
+        self._sweep_stale_tmp_dirs()
         self.tmp_dir = tempfile.mkdtemp(prefix="be-more-agent-")
         self.memory_lock = threading.Lock()
 
-        atexit.register(self.safe_exit)
-        # SIGTERM (systemd stop, shutdown) and SIGINT (Ctrl+C) take the same
-        # save-and-quit path. Python runs these on the main (tkinter) thread
-        # the next time it executes bytecode, which the animation timer
-        # guarantees at least every 500ms.
-        signal.signal(signal.SIGTERM, self._handle_exit_signal)
-        signal.signal(signal.SIGINT, self._handle_exit_signal)
-        
         # State
         self.current_state = BotStates.WARMUP
         self.animations = {}
@@ -526,7 +579,6 @@ class BotGUI:
         self.tts_active = threading.Event()
         self.exiting = False
         self.turn_cam_path = None
-        self.llm_ready = False
         # True while the text box ends in an unfinished "BOT: ..." line. Only
         # the main-loop thread appends conversation text, so it owns this flag.
         self._bot_line_open = False
@@ -582,9 +634,42 @@ class BotGUI:
         self.update_animation()
         self._process_ui_queue()
 
+        # Registered last: safe_exit reads exiting, the Events, both memories,
+        # memory_lock, tmp_dir and master, all of which now exist. A signal
+        # during the (slow) Piper/wake-word loading above gets Python's default
+        # handling; any temp dir it leaves is swept on the next start.
+        atexit.register(self.safe_exit)
+        # SIGTERM (systemd stop, shutdown) and SIGINT (Ctrl+C) take the same
+        # save-and-quit path. Python runs these on the main (tkinter) thread
+        # the next time it executes bytecode, which the animation timer
+        # guarantees at least every 500ms.
+        signal.signal(signal.SIGTERM, self._handle_exit_signal)
+        signal.signal(signal.SIGINT, self._handle_exit_signal)
+
         threading.Thread(target=self.safe_main_execution, daemon=True).start()
 
     # --- HELPERS ---
+
+    def _sweep_stale_tmp_dirs(self):
+        """Remove temp dirs left by earlier runs that died without safe_exit
+        (SIGKILL, power loss). Called before this run creates its own."""
+        removed = 0
+        try:
+            tmp_root = tempfile.gettempdir()
+            uid = os.getuid()
+            for entry in os.scandir(tmp_root):
+                try:
+                    if (entry.name.startswith("be-more-agent-")
+                            and entry.is_dir(follow_symlinks=False)
+                            and entry.stat(follow_symlinks=False).st_uid == uid):
+                        shutil.rmtree(entry.path, ignore_errors=True)
+                        removed += 1
+                except OSError:
+                    continue
+        except OSError as e:
+            log.warning(f"[INIT] Could not sweep old temp dirs: {e}")
+        if removed:
+            log.info(f"[INIT] Removed {removed} temp dir(s) left by earlier runs")
 
     def safe_exit(self):
         # Reachable from the Exit button, Escape, and atexit — run once only
@@ -630,11 +715,13 @@ class BotGUI:
 
     def _process_ui_queue(self):
         # Tk thread only: drain everything queued since the last pass
+        did_work = False
         while True:
             try:
                 fn = self.ui_queue.get_nowait()
             except queue.Empty:
                 break
+            did_work = True
             try:
                 fn()
             except tk.TclError:
@@ -646,7 +733,8 @@ class BotGUI:
         if self.exiting:
             return
         try:
-            self.master.after(30, self._process_ui_queue)
+            # Poll fast while updates are flowing (streamed text), slower when idle
+            self.master.after(30 if did_work else 100, self._process_ui_queue)
         except tk.TclError:
             pass  # window destroyed
 
@@ -791,26 +879,28 @@ class BotGUI:
     # =========================================================================
 
     def execute_tool(self, name, tool_input):
-        """Run a tool requested by Claude and return tool_result content."""
-        log.info(f"TOOL: {name} {tool_input}")
+        """Run a tool requested by Claude. Returns (tool_result content, is_error)."""
+        log.info(f"TOOL: {name}")
 
         if name == "get_time":
             now = datetime.datetime.now().strftime("%I:%M %p")
-            return f"The current time is {now}."
+            return f"The current time is {now}.", False
 
         if name == "search_web":
             query = tool_input.get("query", "")
-            log.info(f"Searching web for: {query}...")
+            log_transcript("Searching web for:", query)
             try:
                 # 'us-en' region is often more stable for CLI queries
                 with DDGS() as ddgs:
                     results = []
+                    search_errors = 0
                     # 1. News search
                     try:
                         results = list(ddgs.news(query, region='us-en', max_results=1))
                         if results:
                             log.debug(f"[SEARCH] Found News: {results[0].get('title')}")
                     except Exception as e:
+                        search_errors += 1
                         log.warning(f"[SEARCH] News Search Error: {e}")
 
                     # 2. Text fallback
@@ -821,34 +911,37 @@ class BotGUI:
                             if results:
                                 log.debug(f"[SEARCH] Found Text: {results[0].get('title')}")
                         except Exception as e:
-                             log.warning(f"[SEARCH] Text Search Error: {e}")
+                            search_errors += 1
+                            log.warning(f"[SEARCH] Text Search Error: {e}")
 
                     if results:
                         r = results[0]
                         # Safe get
                         title = r.get('title', 'No Title')
                         body = r.get('body', r.get('snippet', 'No Body'))
-                        return f"SEARCH RESULTS for '{query}':\nTitle: {title}\nSnippet: {body[:300]}"
-                    else:
-                        log.info("[SEARCH] Search returned 0 results.")
-                        return "The search returned no results."
+                        return f"SEARCH RESULTS for '{query}':\nTitle: {title}\nSnippet: {body[:300]}", False
+                    if search_errors == 2:
+                        # Both searches raised: a failure, not an empty result
+                        return "Search failed: the search service is unreachable right now.", True
+                    log.info("[SEARCH] Search returned 0 results.")
+                    return "The search returned no results.", False
             except Exception as e:
                 log.error(f"[SEARCH] Connection/Library Error: {e}")
-                return "Search failed: the internet is unreachable right now."
+                return "Search failed: the internet is unreachable right now.", True
 
         if name == "capture_image":
             img_path = self.capture_image()
             if not img_path:
-                return "Camera error: no image could be captured."
+                return "Camera error: no image could be captured.", True
             self.turn_cam_path = img_path
             with open(img_path, "rb") as f:
                 img_b64 = base64.b64encode(f.read()).decode("utf-8")
             return [{
                 "type": "image",
                 "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}
-            }]
+            }], False
 
-        return f"Error: unknown tool '{name}'. Available tools: get_time, search_web, capture_image."
+        return f"Error: unknown tool '{name}'. Available tools: get_time, search_web, capture_image.", True
 
     # =========================================================================
     # 4. CORE LOGIC
@@ -903,19 +996,20 @@ class BotGUI:
             # Reachability check. Same optional params as a real turn, so a model
             # that rejects them fails here, at startup. max_tokens leaves room for
             # models that think by default (thinking counts toward the cap).
-            llm_client.messages.create(
+            get_llm_client().messages.create(
                 model=TEXT_MODEL, max_tokens=32,
                 messages=[{"role": "user", "content": "hi"}], **LLM_KWARGS
             )
             log.info(f"Anthropic API is reachable. Model: {TEXT_MODEL}")
-            self.llm_ready = True
         except Exception as e:
             log.error(f"Failed to reach Anthropic API: {e}")
-            self.llm_ready = False
             # Make the failure visible and audible instead of greeting as if all
             # is well. The main loop still starts, so PTT keeps working and a
             # failed turn shows "Brain Freeze!" as usual.
-            self.set_state(BotStates.ERROR, "Can't reach Claude: check API key / network")
+            if isinstance(e, MissingAPIKeyError):
+                self.set_state(BotStates.ERROR, "No API key: set ANTHROPIC_API_KEY in .env")
+            else:
+                self.set_state(BotStates.ERROR, "Can't reach Claude: check API key / network")
             self.play_sound(self.get_random_sound(error_sounds_dir))
             time.sleep(3)
             return
@@ -1158,9 +1252,9 @@ class BotGUI:
             log.info("[AUDIO] Non-speech audio — ignoring.")
             return False
 
-        normalized = re.sub(r"[^a-z0-9 ]", "", residue.lower()).strip()
-        if normalized in WHISPER_HALLUCINATIONS:
-            log.info(f"[AUDIO] Silence hallucination '{transcription}' — ignoring.")
+        if normalize_words(residue) in WHISPER_HALLUCINATIONS:
+            # The text itself was already logged (or redacted) as "Heard:"
+            log.info("[AUDIO] Silence hallucination — ignoring.")
             return False
 
         return True
@@ -1184,7 +1278,7 @@ class BotGUI:
             # whisper-cli prints one timestamped line per segment; join them all
             segments = [WHISPER_TIMESTAMP_RE.sub("", line).strip() for line in result.stdout.split('\n')]
             transcription = " ".join(seg for seg in segments if seg)
-            log.info(f"Heard: '{transcription}'")
+            log_transcript("Heard:", transcription)
             if not self._is_speech(transcription):
                 return ""
             return transcription.strip()
@@ -1241,7 +1335,14 @@ class BotGUI:
         if MEMORY_WIPE_RE.match(normalized):
             self.session_memory = []
             self.permanent_memory = [{"role": "system", "content": SYSTEM_PROMPT}]
-            self.save_chat_history()
+            if CHAT_MEMORY_ENABLED:
+                self.save_chat_history()
+            else:
+                # save_chat_history() is a no-op with memory off; don't leave a
+                # memory.json from an earlier run that had it on
+                with self.memory_lock:
+                    self._remove_file(MEMORY_FILE)
+                    self._remove_file(MEMORY_FILE + ".tmp")
             self.tts_queue.put("Okay. Memory wiped.")
             self.wait_for_tts()
             self.interrupted.clear()
@@ -1267,17 +1368,26 @@ class BotGUI:
         full_response_text = ""
 
         try:
+            client = get_llm_client()
             for _ in range(MAX_TOOL_ROUNDS):
                 sentence_buffer = ""
                 final_message = None
+                round_started = False
 
-                with llm_client.messages.stream(
+                with client.messages.stream(
                     model=TEXT_MODEL, messages=messages, system=SYSTEM_PROMPT,
                     tools=turn_tools, max_tokens=1024, **LLM_KWARGS
                 ) as stream:
                     for content in stream.text_stream:
                         if self.interrupted.is_set(): break
                         if not content: continue
+                        if not round_started:
+                            round_started = True
+                            # Text after a tool result continues the same "BOT: "
+                            # line; keep it from gluing onto the text before the
+                            # tool call ("Let me check.It is...")
+                            if full_response_text and not full_response_text[-1].isspace():
+                                content = " " + content
                         full_response_text += content
 
                         self.thinking_sound_active.clear()
@@ -1330,11 +1440,15 @@ class BotGUI:
                         })
                         continue
                     try:
-                        tool_results.append({
+                        result_content, is_error = self.execute_tool(block.name, block.input)
+                        tool_result = {
                             "type": "tool_result",
                             "tool_use_id": block.id,
-                            "content": self.execute_tool(block.name, block.input)
-                        })
+                            "content": result_content
+                        }
+                        if is_error:
+                            tool_result["is_error"] = True
+                        tool_results.append(tool_result)
                     except Exception as e:
                         # Report the failure to Claude instead of aborting the turn
                         log.exception(f"[TOOL] {block.name} failed: {e!r}")
@@ -1358,7 +1472,6 @@ class BotGUI:
                 if len(self.session_memory) > MAX_HISTORY_MESSAGES:
                     del self.session_memory[:-MAX_HISTORY_MESSAGES]
                 self.save_chat_history()
-            self.llm_ready = True
 
             self.wait_for_tts()
             # Playback is finished; a spacebar interrupt of this response must
@@ -1411,7 +1524,7 @@ class BotGUI:
             log.warning("[PIPER] Voice not loaded; skipping playback.")
             return
 
-        log.info(f"[PIPER SPEAKING] '{clean}'")
+        log_transcript("[PIPER SPEAKING]", clean)
 
         try:
             device_info = sd.query_devices(kind='output')
@@ -1568,25 +1681,23 @@ class BotGUI:
         except Exception as e:
             log.warning(f"[WARN] Could not read {MEMORY_FILE}: {e}. Starting fresh.")
             return fresh
-        valid = (isinstance(history, list) and history
-                 and all(isinstance(m, dict) and "role" in m and "content" in m for m in history)
-                 and history[0]["role"] == "system")
-        if not valid:
+        if not is_valid_memory(history):
             log.warning(f"[WARN] {MEMORY_FILE} is malformed. Starting fresh.")
             return fresh
         return history
 
     def save_chat_history(self):
         if not CHAT_MEMORY_ENABLED: return
-        # The system entry is rebuilt from the current prompt rather than
-        # trusting position 0; only the conversation itself is carried over.
-        conv = [m for m in (self.permanent_memory + self.session_memory) if m.get("role") != "system"]
-        if len(conv) > 10: conv = conv[-10:]
-        data = [{"role": "system", "content": SYSTEM_PROMPT}] + conv
         tmp_path = MEMORY_FILE + ".tmp"
         # Called from the main loop after each turn and from safe_exit on the
-        # tkinter thread; the lock keeps the two from sharing the temp file.
+        # tkinter thread; the lock keeps the two from sharing the temp file,
+        # and taking the snapshot under it means saves land in the order taken.
         with self.memory_lock:
+            # The system entry is rebuilt from the current prompt rather than
+            # trusting position 0; only the conversation itself is carried over.
+            conv = [m for m in (self.permanent_memory + self.session_memory) if m.get("role") != "system"]
+            if len(conv) > 10: conv = conv[-10:]
+            data = [{"role": "system", "content": SYSTEM_PROMPT}] + conv
             try:
                 # Write a private temp file, then atomically swap it in, so a
                 # crash or power loss mid-write never leaves a truncated memory
