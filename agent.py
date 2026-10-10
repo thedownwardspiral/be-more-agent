@@ -85,6 +85,7 @@ import signal
 import stat
 import shutil
 import tempfile
+import fcntl
 
 # Suppress harmless library warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="ddgs")
@@ -288,6 +289,11 @@ def log_transcript(prefix, text):
     else:
         log.debug(f"{prefix} <redacted, {len(text)} chars>")
 
+def _err_summary(e):
+    """An exception for the log: the full message only when log_transcripts is
+    on, since some messages (e.g. ddgs errors) embed the user's query."""
+    return f"{type(e).__name__}: {e}" if LOG_TRANSCRIPTS else type(e).__name__
+
 # Optional request parameters, passed to every Claude call. A null config value
 # leaves the parameter out so the model's own default applies.
 LLM_KWARGS = {}
@@ -295,6 +301,10 @@ if CURRENT_CONFIG["temperature"] is not None:
     LLM_KWARGS["temperature"] = CURRENT_CONFIG["temperature"]
 if CURRENT_CONFIG["effort"] is not None:
     LLM_KWARGS["output_config"] = {"effort": CURRENT_CONFIG["effort"]}
+
+# Cap for each chat response. Thinking tokens count toward it, so allow more
+# when effort is set; otherwise a long think could leave no room for the reply.
+MAX_RESPONSE_TOKENS = 4096 if CURRENT_CONFIG["effort"] else 1024
 
 def restrict_private_files():
     """chmod 600 any existing file that may hold the API key or transcripts."""
@@ -316,8 +326,10 @@ WHISPER_TIMESTAMP_RE = re.compile(r"^\s*\[[\d:.]+\s*-->\s*[\d:.]+\]\s*")
 NON_SPEECH_MARKER_RE = re.compile(r"\[[^\]]*\]|\([^)]*\)|\*[^*]*\*")
 
 def normalize_words(text):
-    """Lowercase, drop punctuation, collapse whitespace: "What's THIS?" -> "whats this"."""
-    return " ".join(re.sub(r"[^\w\s]", "", text.lower()).split())
+    """Lowercase, drop punctuation, collapse whitespace: "What's THIS?" -> "whats this".
+    Hyphens and dashes split words first: "Bye-bye!" -> "bye bye"."""
+    text = re.sub(r"[-–—]", " ", text.lower())
+    return " ".join(re.sub(r"[^\w\s]", "", text).split())
 
 # Well-known whisper hallucinations on silent/near-silent input. Only ever compared
 # against the *entire* transcript, so a real sentence containing these is unaffected.
@@ -345,9 +357,12 @@ def is_valid_memory(history):
             return False
     return True
 
-# Memory wipe fires only when the *whole* utterance is the command, so
-# "don't forget everything" never wipes anything. Matched after normalize.
-MEMORY_WIPE_RE = re.compile(r"^(?:please\s+)?(?:forget everything|reset (?:your )?memory)(?:\s+please)?$")
+# Memory wipe fires only when the *whole* utterance is the command (after a
+# short lead-in such as "okay" or the wake word), so "don't forget everything"
+# never wipes anything. Matched after normalize.
+MEMORY_WIPE_RE = re.compile(
+    r"^(?:(?:ok|okay|hey|hi|um|uh|so|please|bmo|jarvis|robot)\s+)*"
+    r"(?:forget everything|reset (?:your )?memory)(?:\s+(?:please|now))?$")
 
 class MissingAPIKeyError(RuntimeError):
     pass
@@ -371,7 +386,8 @@ def get_llm_client():
                                      "Set ANTHROPIC_API_KEY in .env") from e
         # Recent SDKs don't raise here without a key; the first request then fails
         # with an opaque TypeError. Check up front for a clear message instead.
-        if (getattr(client, "api_key", None) is None and getattr(client, "auth_token", None) is None
+        # Falsy, not None: an empty "ANTHROPIC_API_KEY=" line counts as missing.
+        if (not getattr(client, "api_key", None) and not getattr(client, "auth_token", None)
                 and getattr(client, "credentials", None) is None):
             raise MissingAPIKeyError("ANTHROPIC_API_KEY is not set. Add it to .env")
         llm_client = client
@@ -457,6 +473,7 @@ camera (that tool is only offered on those turns). Use a tool whenever the
 user asks for something a tool provides; otherwise just chat.
 
 Your replies are spoken aloud, so keep them short and conversational.
+You cannot erase your own memory; if asked to, tell the user to say "forget everything".
 """
 
 SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n\n" + CURRENT_CONFIG.get("system_prompt_extras", "")
@@ -507,6 +524,8 @@ TTS_SYMBOL_SUBS = [
     (re.compile(r"\$\s*(\d(?:[\d,]*\d)?(?:\.\d+)?)(\s*(?i:thousand|million|billion|trillion|k|m|bn))?\b"),
      r"\1\2 dollars"),
     (re.compile(r"\$"), " dollars "),
+    # Numeric ranges: "15–20" -> "15 to 20", not "15, 20"
+    (re.compile(r"(?<=\d)\s*[–—]\s*(?=\d)"), " to "),
     # Dashes are stripped below; read them as a pause instead of gluing words
     (re.compile(r"\s*[–—]\s*"), ", "),
     (re.compile(r"%"), " percent"),
@@ -552,9 +571,15 @@ class BotGUI:
         master.bind('<Return>', self.handle_ptt_toggle)
         master.bind('<space>', self.handle_speaking_interrupt)
 
-        # Per-run scratch space for input.wav and camera photos; removed in safe_exit
+        # Per-run scratch space for input.wav and camera photos; removed in safe_exit.
+        # A flock on .lock inside it, held for the life of the process, marks it
+        # as live so another instance's sweep leaves it alone.
         self._sweep_stale_tmp_dirs()
         self.tmp_dir = tempfile.mkdtemp(prefix="be-more-agent-")
+        self.tmp_lock_fd = None
+        self._lock_tmp_dir()
+        # Shown in the IDLE status until a turn succeeds (set by warm_up_logic)
+        self.startup_error = None
         self.memory_lock = threading.Lock()
 
         # State
@@ -650,20 +675,61 @@ class BotGUI:
 
     # --- HELPERS ---
 
+    def _lock_tmp_dir(self):
+        """(Re)create tmp_dir/.lock and hold an exclusive flock on it."""
+        fd = None
+        try:
+            fd = os.open(os.path.join(self.tmp_dir, ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            log.warning(f"[INIT] Could not lock temp dir: {e}")
+            if fd is not None:
+                os.close(fd)
+            return
+        if self.tmp_lock_fd is not None:
+            os.close(self.tmp_lock_fd)
+        self.tmp_lock_fd = fd
+
+    def _ensure_tmp_dir(self):
+        """Recreate tmp_dir if it vanished (systemd-tmpfiles ages out idle /tmp
+        entries after 10 days), along with the lock file that marks it live."""
+        if not os.path.isdir(self.tmp_dir):
+            log.warning(f"[TMP] {self.tmp_dir} vanished; recreating it")
+        os.makedirs(self.tmp_dir, mode=0o700, exist_ok=True)
+        if not os.path.exists(os.path.join(self.tmp_dir, ".lock")):
+            self._lock_tmp_dir()
+
     def _sweep_stale_tmp_dirs(self):
         """Remove temp dirs left by earlier runs that died without safe_exit
-        (SIGKILL, power loss). Called before this run creates its own."""
+        (SIGKILL, power loss). Called before this run creates its own. A dir
+        whose .lock is still flocked belongs to a running instance: skip it."""
         removed = 0
         try:
             tmp_root = tempfile.gettempdir()
             uid = os.getuid()
             for entry in os.scandir(tmp_root):
                 try:
-                    if (entry.name.startswith("be-more-agent-")
+                    if not (entry.name.startswith("be-more-agent-")
                             and entry.is_dir(follow_symlinks=False)
                             and entry.stat(follow_symlinks=False).st_uid == uid):
+                        continue
+                    lock_fd = None
+                    try:
+                        lock_fd = os.open(os.path.join(entry.path, ".lock"), os.O_RDONLY)
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except FileNotFoundError:
+                        pass  # no lock file: a pre-lock run, or one that died early
+                    except OSError:
+                        # EWOULDBLOCK: another instance holds it; anything else: leave it
+                        if lock_fd is not None:
+                            os.close(lock_fd)
+                        continue
+                    try:
                         shutil.rmtree(entry.path, ignore_errors=True)
                         removed += 1
+                    finally:
+                        if lock_fd is not None:
+                            os.close(lock_fd)  # releases the lock
                 except OSError:
                     continue
         except OSError as e:
@@ -688,6 +754,13 @@ class BotGUI:
         except Exception:
             pass
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
+        # Released only after the dir is gone, so no sweep can race the rmtree
+        if self.tmp_lock_fd is not None:
+            try:
+                os.close(self.tmp_lock_fd)
+            except OSError:
+                pass
+            self.tmp_lock_fd = None
         try:
             self.master.quit()
         except Exception:
@@ -866,14 +939,6 @@ class BotGUI:
             self.append_to_text("")
             self._bot_line_open = False
 
-    def _stream_to_text(self, chunk):
-        def update_text_stream():
-            self.response_text.config(state=tk.NORMAL)
-            self.response_text.insert(tk.END, chunk)
-            self.response_text.see(tk.END)
-            self.response_text.config(state=tk.DISABLED)
-        self._ui(update_text_stream)
-
     # =========================================================================
     # 3. TOOL EXECUTION
     # =========================================================================
@@ -901,7 +966,7 @@ class BotGUI:
                             log.debug(f"[SEARCH] Found News: {results[0].get('title')}")
                     except Exception as e:
                         search_errors += 1
-                        log.warning(f"[SEARCH] News Search Error: {e}")
+                        log.warning(f"[SEARCH] News Search Error: {_err_summary(e)}")
 
                     # 2. Text fallback
                     if not results:
@@ -912,7 +977,7 @@ class BotGUI:
                                 log.debug(f"[SEARCH] Found Text: {results[0].get('title')}")
                         except Exception as e:
                             search_errors += 1
-                            log.warning(f"[SEARCH] Text Search Error: {e}")
+                            log.warning(f"[SEARCH] Text Search Error: {_err_summary(e)}")
 
                     if results:
                         r = results[0]
@@ -926,7 +991,7 @@ class BotGUI:
                     log.info("[SEARCH] Search returned 0 results.")
                     return "The search returned no results.", False
             except Exception as e:
-                log.error(f"[SEARCH] Connection/Library Error: {e}")
+                log.error(f"[SEARCH] Connection/Library Error: {_err_summary(e)}")
                 return "Search failed: the internet is unreachable right now.", True
 
         if name == "capture_image":
@@ -955,36 +1020,44 @@ class BotGUI:
             self.tts_thread.start()
             
             while True:
-                trigger_source = self.detect_wake_word_or_ptt()
-                if self.interrupted.is_set():
-                    self.interrupted.clear()
-                    self.set_state(BotStates.IDLE, "Resetting...")
-                    continue
-
-                self.set_state(BotStates.LISTENING, "I'm listening!")
-                
-                audio_file = None
-                if trigger_source == "PTT":
-                    audio_file = self.record_voice_ptt()
-                else:
-                    audio_file = self.record_voice_adaptive()
-                
-                if not audio_file: 
-                    self.set_state(BotStates.IDLE, "Heard nothing.")
-                    continue
-                
+                # One bad turn must not stop the bot listening for good
                 try:
-                    user_text = self.transcribe_audio(audio_file)
-                finally:
-                    # The recording is only needed for whisper; don't leave it on disk
-                    self._remove_file(audio_file)
-                if not user_text:
-                    self.set_state(BotStates.IDLE, "Transcription empty.")
-                    continue
+                    trigger_source = self.detect_wake_word_or_ptt()
+                    if self.interrupted.is_set():
+                        self.interrupted.clear()
+                        self.set_state(BotStates.IDLE, "Resetting...")
+                        continue
+
+                    self.set_state(BotStates.LISTENING, "I'm listening!")
                 
-                self.append_to_text(f"YOU: {user_text}")
-                self.interrupted.clear()
-                self.chat_and_respond(user_text)
+                    audio_file = None
+                    if trigger_source == "PTT":
+                        audio_file = self.record_voice_ptt()
+                    else:
+                        audio_file = self.record_voice_adaptive()
+                
+                    if not audio_file: 
+                        self.set_state(BotStates.IDLE, "Heard nothing.")
+                        continue
+                
+                    try:
+                        user_text = self.transcribe_audio(audio_file)
+                    finally:
+                        # The recording is only needed for whisper; don't leave it on disk
+                        self._remove_file(audio_file)
+                    if not user_text:
+                        self.set_state(BotStates.IDLE, "Transcription empty.")
+                        continue
+                
+                    self.append_to_text(f"YOU: {user_text}")
+                    self.interrupted.clear()
+                    self.chat_and_respond(user_text)
+                except Exception:
+                    log.exception("[MAIN] Turn failed; recovering")
+                    self.thinking_sound_active.clear()
+                    self._end_bot_line()
+                    self.set_state(BotStates.ERROR, "Something went wrong")
+                    time.sleep(2)
                     
         except Exception as e:
             log.exception("[CRITICAL] Main loop crashed")
@@ -1004,12 +1077,14 @@ class BotGUI:
         except Exception as e:
             log.error(f"Failed to reach Anthropic API: {e}")
             # Make the failure visible and audible instead of greeting as if all
-            # is well. The main loop still starts, so PTT keeps working and a
-            # failed turn shows "Brain Freeze!" as usual.
+            # is well. The main loop still starts, so PTT keeps working; the
+            # message stays in the status line (and replaces "Brain Freeze!" on
+            # a failed turn) until a turn succeeds.
             if isinstance(e, MissingAPIKeyError):
-                self.set_state(BotStates.ERROR, "No API key: set ANTHROPIC_API_KEY in .env")
+                self.startup_error = "No API key: set ANTHROPIC_API_KEY in .env"
             else:
-                self.set_state(BotStates.ERROR, "Can't reach Claude: check API key / network")
+                self.startup_error = "Can't reach Claude: check API key / network"
+            self.set_state(BotStates.ERROR, self.startup_error)
             self.play_sound(self.get_random_sound(error_sounds_dir))
             time.sleep(3)
             return
@@ -1017,7 +1092,9 @@ class BotGUI:
         log.info("Ready.")
 
     def detect_wake_word_or_ptt(self):
-        self.set_state(BotStates.IDLE, "Waiting...")
+        # Keep a failed warm-up visible until a turn succeeds
+        status = f"Waiting... ({self.startup_error})" if self.startup_error else "Waiting..."
+        self.set_state(BotStates.IDLE, status)
         self.ptt_event.clear()
         
         if self.oww_model: self.oww_model.reset()
@@ -1214,11 +1291,17 @@ class BotGUI:
         audio_data = np.nan_to_num(audio_data, nan=0.0, posinf=0.0, neginf=0.0)
         # Clip first: samples beyond +/-1.0 would wrap around in int16
         audio_data = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16)
-        with wave.open(filename, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(samplerate)
-            wf.writeframes(audio_data.tobytes())
+        try:
+            self._ensure_tmp_dir()
+            with wave.open(filename, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(samplerate)
+                wf.writeframes(audio_data.tobytes())
+        except OSError as e:
+            log.error(f"[AUDIO ERROR] Could not save recording: {e}")
+            self._remove_file(filename)
+            return None
         self.play_sound(self.get_random_sound(ack_sounds_dir))
         return filename
 
@@ -1293,6 +1376,7 @@ class BotGUI:
         self.set_state(BotStates.CAPTURING, "Watching...")
         img_path = os.path.join(self.tmp_dir, BMO_IMAGE_FILE)
         try:
+            self._ensure_tmp_dir()
             subprocess.run(["rpicam-still", "-t", "500", "-n", "--width", "640", "--height", "480", "-o", img_path],
                            check=True, timeout=20)
             rotation = CURRENT_CONFIG.get("camera_rotation", 0)
@@ -1376,7 +1460,7 @@ class BotGUI:
 
                 with client.messages.stream(
                     model=TEXT_MODEL, messages=messages, system=SYSTEM_PROMPT,
-                    tools=turn_tools, max_tokens=1024, **LLM_KWARGS
+                    tools=turn_tools, max_tokens=MAX_RESPONSE_TOKENS, **LLM_KWARGS
                 ) as stream:
                     for content in stream.text_stream:
                         if self.interrupted.is_set(): break
@@ -1400,7 +1484,7 @@ class BotGUI:
                             self.append_to_text("BOT: ", newline=False)
                             self._bot_line_open = True
 
-                        self._stream_to_text(content)
+                        self.append_to_text(content, newline=False)
 
                         sentence_buffer += content
                         if re.search(r'[.!?][\s\n]*$', sentence_buffer) and len(sentence_buffer.strip()) >= TTS_MIN_SENTENCE_LENGTH:
@@ -1464,6 +1548,8 @@ class BotGUI:
                 self._start_thinking_sound()
 
             self.thinking_sound_active.clear()
+            # Claude answered, so whatever failed at warm-up has recovered
+            self.startup_error = None
 
             if not self.interrupted.is_set():
                 self.session_memory.append({"role": "user", "content": text})
@@ -1486,7 +1572,7 @@ class BotGUI:
             # or the bot records and answers its own voice
             self.wait_for_tts()
             self.interrupted.clear()
-            self.set_state(BotStates.ERROR, "Brain Freeze!")
+            self.set_state(BotStates.ERROR, self.startup_error or "Brain Freeze!")
 
         # Finish the reply's line on every exit path (done, interrupted, error)
         # so the next "YOU:" starts on a line of its own.
