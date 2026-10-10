@@ -77,7 +77,20 @@ if [ ! -f "whisper.cpp/CMakeLists.txt" ]; then
         rm -rf whisper.cpp
     fi
     git clone "$WHISPER_CPP_REPO" whisper.cpp
-    git -C whisper.cpp -c advice.detachedHead=false checkout "$WHISPER_CPP_COMMIT"
+fi
+# Apply the pin on every run, not just after a fresh clone, so an existing
+# checkout (or a bumped WHISPER_CPP_COMMIT) builds the pinned revision.
+# Require whisper.cpp/.git: without it, git would walk up and act on this repo.
+if [ -e "whisper.cpp/.git" ] && git -C whisper.cpp rev-parse --git-dir >/dev/null 2>&1; then
+    if [ "$(git -C whisper.cpp rev-parse HEAD)" != "$WHISPER_CPP_COMMIT" ]; then
+        echo -e "${YELLOW}Checking out pinned whisper.cpp commit ${WHISPER_CPP_COMMIT:0:12}...${NC}"
+        # Fetching a bare SHA needs a reasonably recent git; fall back to a full fetch.
+        git -C whisper.cpp fetch --quiet origin "$WHISPER_CPP_COMMIT" \
+            || git -C whisper.cpp fetch --quiet origin
+        git -C whisper.cpp -c advice.detachedHead=false checkout --quiet "$WHISPER_CPP_COMMIT"
+    fi
+else
+    echo -e "${YELLOW}⚠️  whisper.cpp/ is not a git checkout; cannot apply pin ${WHISPER_CPP_COMMIT:0:12}. Building it as-is.${NC}"
 fi
 (
     cd whisper.cpp
