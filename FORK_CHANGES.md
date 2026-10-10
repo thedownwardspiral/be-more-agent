@@ -24,20 +24,24 @@ stack with the cloud-based Anthropic API (Claude).
 
 - **Import**: `import ollama` replaced with `import anthropic` and
   `from dotenv import load_dotenv`.
-- **Client**: A module-level `llm_client = anthropic.Anthropic()` client
-  is created, reading `ANTHROPIC_API_KEY` from the environment.
+- **Client**: A module-level `llm_client = anthropic.Anthropic(timeout=60.0,
+  max_retries=2)` client is created, reading `ANTHROPIC_API_KEY` from the
+  environment.
 - **Model config**: The `vision_model` config key was removed. A single
   `text_model` is used for both text and vision. The model can be
   overridden via the `ANTHROPIC_MODEL` environment variable.
-- **LLM settings**: `OLLAMA_OPTIONS` dict (keep_alive, num_thread,
-  temperature, top_k, top_p) replaced with standalone `LLM_TEMPERATURE`
-  and `LLM_TOP_P` constants.
+- **LLM settings**: The `OLLAMA_OPTIONS` dict (keep_alive, num_thread,
+  temperature, top_k, top_p) was removed. Optional request parameters now
+  come from config (`temperature`, `effort`) via `LLM_KWARGS`; see
+  [Review Remediation](#review-remediation-robustness-safety-quality).
 - **Chat messages**: Vision messages changed from Ollama's
   `{"images": [path]}` format to Anthropic's base64 content blocks with
   `{"type": "image", "source": {"type": "base64", ...}}`.
-- **Message building**: A new `_build_messages()` helper constructs the
-  messages list and handles the history/vision split. The original
-  inlined this logic in `chat_and_respond()`.
+- **Message building**: A `_history_messages()` helper returns the chat
+  history as Anthropic messages (skipping legacy `system` entries, capped
+  at `max_history_messages`, and starting at a user message);
+  `chat_and_respond()` appends the new user message. The original inlined
+  this logic in `chat_and_respond()`.
 - **System prompt**: Passed via the `system=` parameter on API calls
   instead of as a message role.
 - **Warm-up**: `ollama.generate(keep_alive=-1)` (pre-load model into
@@ -108,12 +112,13 @@ count (`-t 4`).
 | Key               | Default                                 | Description                        |
 | ----------------- | --------------------------------------- | ---------------------------------- |
 | `whisper_model`   | `./whisper.cpp/models/ggml-base.en.bin` | Path to the whisper.cpp model file |
-| `whisper_threads` | `2`                                     | CPU threads for transcription      |
+| `whisper_threads` | `3`                                     | CPU threads for transcription      |
 
 ### Why
 
-- **Threads reduced from 4 to 2**: Leaves CPU headroom for the GUI,
-  audio pipeline, and TTS during transcription.
+- **Threads reduced from 4 to 3** (briefly 2): Benchmarked on a Pi 5, the
+  4th thread saves ~40 ms while starving the GUI and audio threads; 2
+  threads cost about a second per utterance.
 - **Model is configurable**: Users can swap between `tiny`, `base`,
   `small`, or quantized variants without editing code.
 
@@ -140,7 +145,7 @@ testing.
 | `example.env`       | Template for `.env` with `ANTHROPIC_API_KEY` |
 | `.env`              | Gitignored file holding the actual API key   |
 | `CLAUDE.md`         | Project context for Claude Code              |
-| `AGENTS.md`         | Project context for AI coding agents         |
+| `AGENTS.md`         | Short pointer to `CLAUDE.md` for other agents |
 
 ### Dependency manifest (`requirements.txt` → `pyproject.toml`)
 
@@ -167,9 +172,9 @@ instead of a prebuilt binary.
   found.
 - **BLAS package**: Falls back to `libopenblas-dev` if `libatlas-base-dev`
   is not available (compatibility with newer Pi OS releases).
-- **Whisper.cpp**: Added a build step (step 6/7) that clones, compiles,
-  and downloads the `base.en` model. The original did not include
-  whisper.cpp setup.
+- **Whisper.cpp**: Added a build step (now step 5/9) that clones,
+  compiles, and downloads the `base.en` model. The original did not
+  include whisper.cpp setup.
 - **Ollama model pull removed**: The `ollama pull gemma3:1b` and
   `ollama pull moondream` steps were removed.
 
@@ -181,7 +186,7 @@ instead of a prebuilt binary.
 | `vision_model`           | `moondream`                       | Removed (Claude handles vision)         |
 | `voice_model`            | `piper/en_GB-semaine-medium.onnx` | `piper/en_US-bmo-medium.onnx`           |
 | `whisper_model`          | --                                | `./whisper.cpp/models/ggml-base.en.bin` |
-| `whisper_threads`        | --                                | `2`                                     |
+| `whisper_threads`        | --                                | `3`                                     |
 | `audio_energy_threshold` | --                                | `0.002`                                 |
 | `system_prompt`          | Present                           | Present (unchanged structure)           |
 
@@ -216,7 +221,9 @@ This fork now uses the Anthropic API's native tool use:
   errors) naturally.
 - **`chat_and_respond()`** streams until `stop_reason == "tool_use"`, runs
   the requested tools, appends the assistant content and `tool_result`
-  blocks, and loops (bounded by `MAX_TOOL_ROUNDS`). The separate
+  blocks, and loops. After `MAX_TOOL_ROUNDS` rounds of tool use, a final
+  call is made with `tool_choice` `"none"` so Claude must answer in text,
+  with a spoken fallback if it still produces nothing. The separate
   "summarize this result" second API call is gone — the follow-up response
   has full conversation context.
 - **`extract_json_from_text()`** and the `'{"' in content` stream sniffing
@@ -274,3 +281,139 @@ to disable.
 The unused `system_prompt` key (which still described the old JSON action
 protocol; the code reads `system_prompt_extras`) was removed, and
 `input_device` / `input_sample_rate` were added with `null` defaults.
+
+## Recording and Listening Fixes
+
+- **Adaptive noise floor** (db44f6e): room noise often sat above the fixed
+  silence threshold, so every recording ran the full 30 s.
+  `record_voice_adaptive()` now tracks the ambient floor (20th percentile
+  of chunk volumes), compares a 250 ms smoothed volume against
+  `max(silence_threshold, min(floor * 2.2, 0.015))`, stops 1.5 s after
+  speech ends, and allows up to 5 s of leading silence. New config key
+  `silence_threshold` (default `0.006`).
+- **No self-hearing** (db44f6e): the LLM-error and memory-wipe paths now
+  wait for TTS to finish before returning, so the mic never reopens while
+  the bot is still talking.
+- **Thinking sounds never overlap speech** (db44f6e): clips don't start
+  while speech is queued or playing, and an in-flight clip stops itself
+  when speech starts, from its own thread (stopping another thread's
+  `sd.play` crashes PortAudio).
+- **stdin-EOF idle loop** (b29a910): `_listen_loop` polled stdin for a
+  terminal "press Enter" trigger, but an EOF stdin (desktop autostart,
+  systemd) is permanently readable, so the agent woke, recorded and
+  answered on every pass. stdin is now polled only when it is a tty, and
+  EOF stops the polling.
+- **`_is_speech()` hallucination filter** (b29a910): whisper annotates
+  non-speech (`[BLANK_AUDIO]`, `(wind blowing)`, `*coughs*`) instead of
+  returning nothing. Transcripts that are only such markers, or exactly a
+  known silence hallucination ("you", "thanks for watching", ...), are
+  dropped. A regex now strips only the timestamp prefix, so markers are
+  parsed intact.
+- **Wake-word tuning keys** (b29a910): `wake_word_threshold` (0.5) and
+  `wake_word_consecutive` (1), with a `[WAKE]` log line on detection.
+
+## uv and `.venv`
+
+`python3 -m venv .bmo` + `pip install -r requirements.txt` was replaced
+with uv (ad1c061): `pyproject.toml` is the single manifest, `uv.lock` pins
+versions, and `uv sync` builds `.venv/`. `requirements.txt` was removed.
+`start_agent.sh` execs `.venv/bin/python` directly. Two load-bearing
+constraints live in `pyproject.toml`: `openwakeword<0.5` (0.5+ needs
+`tflite-runtime`, which has no CPython 3.13/aarch64 wheel) and
+`python-preference = "only-system"` (tkinter comes from the apt
+`python3-tk`, which only equips the system interpreter). Claude Code
+memory files swept into that commit were untracked and ignored (dba4db5).
+
+## Setup and Agent-Loop Review Fixes (PR #2)
+
+- **whisper.cpp setup hardening**: the stale `whisper.cpp` submodule
+  gitlink was dropped; `setup.sh` runs under `set -euo pipefail`, clones
+  when `whisper.cpp/CMakeLists.txt` is missing, checks out a pinned commit
+  (`WHISPER_CPP_COMMIT`) on every run, not only after a fresh clone, and
+  fails if `whisper-cli` was not built.
+- **Whisper segment joining**: every timestamped segment line is joined;
+  previously only the last line was kept, truncating longer utterances.
+- **Interrupt flag**: cleared after playback finishes, so a spacebar
+  interrupt no longer swallows the next wake word.
+- **Fallback stream frames**: the fallback wake-word stream (blocksize
+  1024, high latency) still reads and resamples full 80 ms frames.
+- **History cap**: only the last `max_history_messages` (default 20) chat
+  messages are sent to Claude, and session memory is trimmed in place.
+- **Single thinking-sound thread**: at most one loop thread runs; two
+  threads calling `sd.play()` crashed PortAudio.
+- **Wake-word model download**: the old raw/main URL 404s; the fallback
+  now downloads the openWakeWord v0.5.1 release asset and installs it
+  only if its SHA-256 matches.
+- **Cleanup**: `config.yaml` and `llama-swap.service` (an unused
+  llama-swap/llama.cpp setup from before the Anthropic migration) were
+  removed; `.gitignore` covers `.env.*` (except `example.env`) and
+  `.claude/settings.local.json`; the README credits upstream.
+
+The bundled `sounds/*.wav` clips were deleted earlier (07c0230); the
+`sounds/` folders are created empty by `setup.sh` for your own clips.
+
+## Review Remediation: Robustness, Safety, Quality
+
+### Robustness
+
+- **Launch from anywhere**: `BASE_DIR = Path(__file__).resolve().parent`
+  and `os.chdir(BASE_DIR)` run at startup; `.env` is loaded from
+  `BASE_DIR`.
+- **Timeouts**: Anthropic client `timeout=60.0, max_retries=2`;
+  `whisper-cli` 90 s with a return-code check; `rpicam-still` 20 s.
+- **Tool failures**: an exception from a tool becomes an `is_error`
+  `tool_result` that Claude can explain, instead of aborting the turn.
+- **Warm-up failure**: shows the ERROR face ("Can't reach Claude"), plays
+  an error sound and skips the greeting; the main loop still starts.
+- **Memory**: saved after every turn, atomically (`memory.json.tmp` at
+  mode 0600, fsync, `os.replace`) under a lock; loading validates the
+  file's shape and starts fresh if it is malformed. `chat_memory: false`
+  now really disables reading and writing `memory.json`. The wipe
+  command must be the whole utterance ("forget everything" / "reset
+  (your) memory", optional "please"), so "don't forget everything" is
+  safe.
+- **Shutdown**: SIGTERM/SIGINT run `safe_exit()`.
+- **Private files**: `restrict_private_files()` chmods `.env`,
+  `memory.json` and `agent.log` to 0600 at startup; `setup.sh` does the
+  same (plus `agent.log.*` backups).
+- **Temp files**: `input.wav` and camera photos live in a per-run
+  `tempfile.mkdtemp()` directory, deleted after use and at exit.
+- **Audio**: samples are clipped to ±1.0 before int16 conversion, so loud
+  input no longer wraps around.
+
+### Safety and configuration
+
+- **Camera gating**: `capture_image` is offered only on turns whose text
+  contains a `camera_trigger_words` entry (whole words/phrases, case and
+  punctuation ignored; `[]` = never). The tool list is fixed for the
+  whole turn, and calls to tools not offered get an `is_error` result.
+  The system prompt says so.
+- **TTS normalization** (`normalize_for_tts`): keeps apostrophes and
+  speaks `$`, `%`, `°C`/`°F`/`°`, `&`, `+`, `=`, digit/digit and `#`digit
+  instead of dropping them.
+- **Config validation** (`validate_config`): an unreadable or non-object
+  `config.json` is ignored with a loud error banner; unknown keys are
+  warned about and dropped; each value is type- and range-checked and
+  falls back to its default with a `[CONFIG]` warning.
+- **New keys**: `temperature` (default 0.7; null omits it) and `effort`
+  (default null; when set, sent as `output_config={"effort": ...}`),
+  shared by chat and warm-up via `LLM_KWARGS` (warm-up `max_tokens` is
+  32). Haiku 5.5 recipe: `"text_model": "claude-haiku-5-5",
+  "temperature": null, "effort": "low"`. Default model unchanged:
+  `claude-haiku-4-5`.
+
+### Code quality
+
+- **Logging**: `print` replaced by the `logging` module — logger `bmo` at
+  INFO, root at WARNING, stdout plus a rotating `agent.log` (1 MB × 3
+  backups, always mode 0600). `.gitignore` ignores `agent.log*` and
+  `memory.json.tmp`.
+- **Thread-safe GUI**: worker threads queue UI callables on
+  `self.ui_queue`; `_process_ui_queue()` runs them on the Tk thread every
+  30 ms. `set_state()` updates `current_state` synchronously; the
+  `BOT:` line is tracked by `_bot_line_open`.
+- **Cleanup**: bare `except:` → `except Exception`; unused imports and
+  `current_volume` removed; the animation fallback for states without
+  images now reuses the idle frames.
+- **Linting**: ruff config in `pyproject.toml` (line length 120, py311,
+  E4/E7/E9/F, E402 ignored for `agent.py`). Run `uvx ruff check agent.py`.

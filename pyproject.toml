@@ -28,3 +28,13 @@ package = false
 # setup.sh — that only equips the system interpreter. Forbid uv from silently
 # downloading a managed CPython, which would build a .venv with no working Tk.
 python-preference = "only-system"
+
+# Lint with `uvx ruff check agent.py` (ruff is not a project dependency).
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+# Import order in agent.py is deliberate: DISPLAY, chdir and logging must run before the GUI/audio imports.
+per-file-ignores = { "agent.py" = ["E402"] }

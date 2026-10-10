@@ -29,7 +29,7 @@ if ! command -v lightdm &>/dev/null && ! command -v gdm3 &>/dev/null && ! comman
 fi
 
 # 1. Install System Dependencies (The "Hidden" Requirements)
-echo -e "${YELLOW}[1/8] Installing System Tools (apt)...${NC}"
+echo -e "${YELLOW}[1/9] Installing System Tools (apt)...${NC}"
 sudo apt update
 BLAS_PKG="libopenblas-dev"
 # Capture the policy first: piping straight into `grep -q` can SIGPIPE
@@ -42,7 +42,7 @@ fi
 sudo apt install -y python3-tk libasound2-dev libportaudio2 "$BLAS_PKG" cmake build-essential espeak-ng git
 
 # 2. Create Folders
-echo -e "${YELLOW}[2/8] Creating Folders...${NC}"
+echo -e "${YELLOW}[2/9] Creating Folders...${NC}"
 mkdir -p piper
 mkdir -p sounds/greeting_sounds
 mkdir -p sounds/thinking_sounds
@@ -56,7 +56,7 @@ mkdir -p faces/error
 mkdir -p faces/warmup
 
 # 3. Install Python Libraries (Piper TTS now ships as a Python wheel)
-echo -e "${YELLOW}[3/8] Installing Python Libraries (uv)...${NC}"
+echo -e "${YELLOW}[3/9] Installing Python Libraries (uv)...${NC}"
 if ! command -v uv &>/dev/null; then
     echo -e "${YELLOW}Installing uv...${NC}"
     curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -67,11 +67,11 @@ fi
 uv sync
 
 # 4. Download Voice Model via piper1-gpl's downloader
-echo -e "${YELLOW}[4/8] Downloading Voice Model...${NC}"
+echo -e "${YELLOW}[4/9] Downloading Voice Model...${NC}"
 uv run python -m piper.download_voices --data-dir piper en_US-bmo-medium
 
 # 5. Build whisper.cpp and download model
-echo -e "${YELLOW}[5/8] Building whisper.cpp...${NC}"
+echo -e "${YELLOW}[5/9] Building whisper.cpp...${NC}"
 # Check for CMakeLists.txt rather than the directory: an empty or partial
 # whisper.cpp/ (e.g. left behind by an old submodule pointer or an interrupted
 # clone) must not skip the clone.
@@ -110,7 +110,7 @@ if [ ! -x "whisper.cpp/build/bin/whisper-cli" ]; then
 fi
 
 # 6. OpenWakeWord Model
-echo -e "${YELLOW}[6/8] Checking Wake Word Model...${NC}"
+echo -e "${YELLOW}[6/9] Checking Wake Word Model...${NC}"
 if [ ! -f "wakeword.onnx" ]; then
     echo -e "${YELLOW}Downloading default 'Hey Jarvis' wake word...${NC}"
     if ! curl -fL -o wakeword.onnx.tmp "$WAKEWORD_URL"; then
@@ -127,13 +127,27 @@ if [ ! -f "wakeword.onnx" ]; then
 fi
 
 # 7. Launch script
-echo -e "${YELLOW}[7/8] Making launch script executable...${NC}"
+echo -e "${YELLOW}[7/9] Making launch script executable...${NC}"
 chmod +x start_agent.sh
 
-# 8. Desktop autostart entry (starts the agent with the desktop session)
-echo -e "${YELLOW}[8/8] Installing desktop autostart entry...${NC}"
+# 8. Private files: the API key, chat transcripts and the conversation log
+# are owner read/write only. The agent enforces this at startup too.
+echo -e "${YELLOW}[8/9] Restricting permissions on private files...${NC}"
+for f in .env memory.json agent.log agent.log.*; do
+    # An unmatched glob stays literal, so test -f skips it under set -e
+    if [ -f "$f" ]; then
+        chmod 600 "$f"
+    fi
+done
+
+# 9. Desktop autostart entry (starts the agent with the desktop session)
+echo -e "${YELLOW}[9/9] Installing desktop autostart entry...${NC}"
 mkdir -p "$HOME/.config/autostart"
 sed "s|__BASE_DIR__|$(pwd)|g" be-more-agent.desktop > "$HOME/.config/autostart/be-more-agent.desktop"
 
+if [ ! -f .env ]; then
+    echo -e "${YELLOW}Next: create your API key file and keep it private:${NC}"
+    echo -e "${YELLOW}  cp example.env .env && chmod 600 .env   # then set ANTHROPIC_API_KEY in .env${NC}"
+fi
 echo -e "${GREEN}✨ Setup Complete! Run 'uv run agent.py' (or 'source .venv/bin/activate' then 'python agent.py')${NC}"
 echo -e "${GREEN}   The agent will also autostart with the desktop session (remove ~/.config/autostart/be-more-agent.desktop to disable).${NC}"
