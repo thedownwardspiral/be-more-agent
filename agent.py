@@ -303,8 +303,9 @@ if CURRENT_CONFIG["effort"] is not None:
     LLM_KWARGS["output_config"] = {"effort": CURRENT_CONFIG["effort"]}
 
 # Cap for each chat response. Thinking tokens count toward it, so allow more
-# when effort is set; otherwise a long think could leave no room for the reply.
-MAX_RESPONSE_TOKENS = 4096 if CURRENT_CONFIG["effort"] else 1024
+# when effort is set or temperature is null (the Claude 5.x setup; those models
+# think by default); otherwise a long think could leave no room for the reply.
+MAX_RESPONSE_TOKENS = 4096 if (CURRENT_CONFIG["effort"] or CURRENT_CONFIG["temperature"] is None) else 1024
 
 def restrict_private_files():
     """chmod 600 any existing file that may hold the API key or transcripts."""
@@ -476,7 +477,7 @@ Your replies are spoken aloud, so keep them short and conversational.
 You cannot erase your own memory; if asked to, tell the user to say "forget everything".
 """
 
-SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n\n" + CURRENT_CONFIG.get("system_prompt_extras", "")
+SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n\n" + CURRENT_CONFIG["system_prompt_extras"]
 
 # --- TOOL DEFINITIONS (Anthropic native tool use) ---
 TOOLS = [
@@ -614,7 +615,7 @@ class BotGUI:
         # --- PIPER TTS INITIALIZATION ---
         log.info("[INIT] Loading Piper voice...")
         self.piper_voice = None
-        voice_model = CURRENT_CONFIG.get("voice_model", "piper/en_US-bmo-medium.onnx")
+        voice_model = CURRENT_CONFIG["voice_model"]
         try:
             self.piper_voice = PiperVoice.load(voice_model)
             log.info(f"[INIT] Piper voice loaded: {voice_model}")
@@ -692,10 +693,24 @@ class BotGUI:
 
     def _ensure_tmp_dir(self):
         """Recreate tmp_dir if it vanished (systemd-tmpfiles ages out idle /tmp
-        entries after 10 days), along with the lock file that marks it live."""
-        if not os.path.isdir(self.tmp_dir):
-            log.warning(f"[TMP] {self.tmp_dir} vanished; recreating it")
-        os.makedirs(self.tmp_dir, mode=0o700, exist_ok=True)
+        entries after 10 days), along with the lock file that marks it live.
+        Callers must build paths from self.tmp_dir after this, since it can
+        move to a fresh dir."""
+        # safe_exit removed the dir; don't bring it back behind its rmtree
+        if self.exiting:
+            raise OSError("shutting down")
+        try:
+            os.mkdir(self.tmp_dir, 0o700)
+            log.warning(f"[TMP] {self.tmp_dir} vanished; recreated it")
+        except FileExistsError:
+            # Ours, unless the name was freed and someone else (another local
+            # user) took it: then never write there, start a fresh dir instead
+            st = os.stat(self.tmp_dir, follow_symlinks=False)
+            if st.st_uid != os.getuid() or not stat.S_ISDIR(st.st_mode):
+                old_dir = self.tmp_dir
+                self.tmp_dir = tempfile.mkdtemp(prefix="be-more-agent-")
+                log.warning(f"[TMP] {old_dir} is no longer ours; using {self.tmp_dir}")
+                self._lock_tmp_dir()
         if not os.path.exists(os.path.join(self.tmp_dir, ".lock")):
             self._lock_tmp_dir()
 
@@ -1095,6 +1110,13 @@ class BotGUI:
         # Keep a failed warm-up visible until a turn succeeds
         status = f"Waiting... ({self.startup_error})" if self.startup_error else "Waiting..."
         self.set_state(BotStates.IDLE, status)
+        # Enter pressed while the last turn was still winding down (e.g. after
+        # a spacebar interrupt): PTT is already toggled on, so record now.
+        # Clearing ptt_event and listening would make the next Enter toggle
+        # it off instead, losing the press.
+        if self.recording_active.is_set():
+            self.ptt_event.clear()
+            return "PTT"
         self.ptt_event.clear()
         
         if self.oww_model: self.oww_model.reset()
@@ -1201,12 +1223,11 @@ class BotGUI:
                         return "WAKE"
 
     def record_voice_adaptive(self, filename=None):
-        filename = filename or os.path.join(self.tmp_dir, "input.wav")
         log.info("Recording (Adaptive)...")
         time.sleep(0.5)
         samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
 
-        silence_threshold = CURRENT_CONFIG.get("silence_threshold", 0.006)
+        silence_threshold = CURRENT_CONFIG["silence_threshold"]
         silence_duration = 1.5
         max_record_time = 30.0
         buffer = []
@@ -1264,7 +1285,6 @@ class BotGUI:
         return self.save_audio_buffer(buffer, filename, samplerate)
 
     def record_voice_ptt(self, filename=None):
-        filename = filename or os.path.join(self.tmp_dir, "input.wav")
         log.info("Recording (PTT)...")
         time.sleep(0.5)
         samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
@@ -1281,6 +1301,8 @@ class BotGUI:
                 while self.recording_active.is_set(): sd.sleep(50)
         except Exception as e:
             log.error(f"[AUDIO ERROR] PTT Recording Failed: {e}")
+            # End the PTT session, or detect_wake_word_or_ptt would retry at once
+            self.recording_active.clear()
             return None
 
         return self.save_audio_buffer(buffer, filename, samplerate)
@@ -1293,6 +1315,8 @@ class BotGUI:
         audio_data = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16)
         try:
             self._ensure_tmp_dir()
+            # Resolved after _ensure_tmp_dir, which may have moved tmp_dir
+            filename = filename or os.path.join(self.tmp_dir, "input.wav")
             with wave.open(filename, "wb") as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
@@ -1300,14 +1324,15 @@ class BotGUI:
                 wf.writeframes(audio_data.tobytes())
         except OSError as e:
             log.error(f"[AUDIO ERROR] Could not save recording: {e}")
-            self._remove_file(filename)
+            if filename:
+                self._remove_file(filename)
             return None
         self.play_sound(self.get_random_sound(ack_sounds_dir))
         return filename
 
     def _check_audio_energy(self, filename):
         """Return True if audio has enough energy to be worth transcribing."""
-        threshold = CURRENT_CONFIG.get("audio_energy_threshold", 0.002)
+        threshold = CURRENT_CONFIG["audio_energy_threshold"]
         try:
             with wave.open(filename, 'rb') as wf:
                 data = wf.readframes(wf.getnframes())
@@ -1348,8 +1373,8 @@ class BotGUI:
             return ""
 
         log.info("Transcribing...")
-        whisper_model = CURRENT_CONFIG.get("whisper_model", "./whisper.cpp/models/ggml-base.en.bin")
-        whisper_threads = str(CURRENT_CONFIG.get("whisper_threads", 3))
+        whisper_model = CURRENT_CONFIG["whisper_model"]
+        whisper_threads = str(CURRENT_CONFIG["whisper_threads"])
         try:
             result = subprocess.run(
                 ["./whisper.cpp/build/bin/whisper-cli", "-m", whisper_model, "-l", "en", "-t", whisper_threads, "-f", filename],
@@ -1374,12 +1399,13 @@ class BotGUI:
 
     def capture_image(self):
         self.set_state(BotStates.CAPTURING, "Watching...")
-        img_path = os.path.join(self.tmp_dir, BMO_IMAGE_FILE)
         try:
             self._ensure_tmp_dir()
+            # Built after _ensure_tmp_dir, which may have moved tmp_dir
+            img_path = os.path.join(self.tmp_dir, BMO_IMAGE_FILE)
             subprocess.run(["rpicam-still", "-t", "500", "-n", "--width", "640", "--height", "480", "-o", img_path],
                            check=True, timeout=20)
-            rotation = CURRENT_CONFIG.get("camera_rotation", 0)
+            rotation = CURRENT_CONFIG["camera_rotation"]
             if rotation != 0:
                 img = Image.open(img_path)
                 img = img.rotate(rotation, expand=True) 
@@ -1512,6 +1538,9 @@ class BotGUI:
                 messages.append({"role": "assistant", "content": final_message.content})
                 tool_results = []
                 for block in final_message.content:
+                    # Spacebar during a slow tool (search_web): run no more
+                    if self.interrupted.is_set():
+                        break
                     if block.type != "tool_use":
                         continue
                     if block.name not in turn_tool_names:
@@ -1542,6 +1571,10 @@ class BotGUI:
                             "content": f"Tool {block.name} failed: {e}",
                             "is_error": True
                         })
+                # Interrupted: don't send the results or restart the thinking
+                # sound; the code after the loop finishes the turn quietly
+                if self.interrupted.is_set():
+                    break
                 messages.append({"role": "user", "content": tool_results})
 
                 self.set_state(BotStates.THINKING, "Reading...", cam_path=self.turn_cam_path)
