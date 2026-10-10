@@ -14,6 +14,55 @@
 import os
 os.environ.setdefault("DISPLAY", ":0")
 
+from pathlib import Path
+
+# Every relative path in this file (config.json, .env, memory.json, faces/,
+# sounds/, piper/, wakeword.onnx, and the whisper.cpp paths in config.json) is
+# relative to the repo root. Anchor the process there so the agent works no
+# matter which directory it was launched from (SSH, systemd, autostart).
+BASE_DIR = Path(__file__).resolve().parent
+os.chdir(BASE_DIR)
+
+import logging
+import logging.handlers
+import sys
+
+class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """RotatingFileHandler whose log file is always mode 600.
+
+    The log holds transcripts. _open() runs on first open and again after every
+    rollover, so creating the file with 0o600 here (and fchmod-ing a file that
+    already existed) covers agent.log itself; the numbered backups are renames
+    of it and keep the same mode.
+    """
+    def _open(self):
+        fd = os.open(self.baseFilename, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass  # not our file; still usable
+        return os.fdopen(fd, self.mode, encoding=self.encoding, errors=self.errors)
+
+def _setup_logging():
+    handlers = [logging.StreamHandler(sys.stdout)]
+    file_error = None
+    try:
+        handlers.append(_PrivateRotatingFileHandler(
+            BASE_DIR / "agent.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8"))
+    except OSError as e:
+        file_error = e
+    # Root at WARNING so library warnings land in the log too, without the
+    # per-request INFO chatter from httpx/anthropic; our own logger is INFO.
+    logging.basicConfig(level=logging.WARNING, handlers=handlers,
+                        format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+    logger = logging.getLogger("bmo")
+    logger.setLevel(logging.INFO)
+    if file_error:
+        logger.warning(f"[LOG] Could not open agent.log ({file_error}); logging to stdout only")
+    return logger
+
+log = _setup_logging()
+
 import tkinter as tk
 from tkinter import ttk
 from PIL import Image, ImageTk
@@ -23,16 +72,17 @@ import json
 import subprocess
 import random
 import re
-import sys
 import select
-import traceback
 import atexit
 import datetime
 import warnings
 import wave
-import struct
 import queue
 import collections
+import signal
+import stat
+import shutil
+import tempfile
 
 # Suppress harmless library warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="ddgs")
@@ -43,15 +93,14 @@ import numpy as np
 import scipy.signal 
 
 # --- AI ENGINES ---
-import openwakeword
 from openwakeword.model import Model
 import anthropic
 from piper import PiperVoice
 from dotenv import load_dotenv
 import base64
 
-# Load environment variables from .env file
-load_dotenv()
+# Load environment variables from the repo's .env file
+load_dotenv(BASE_DIR / ".env")
 
 # --- WEB SEARCH (Using your working import) ---
 from ddgs import DDGS
@@ -62,8 +111,10 @@ from ddgs import DDGS
 
 CONFIG_FILE = "config.json"
 MEMORY_FILE = "memory.json"
-BMO_IMAGE_FILE = "current_image.jpg"
+BMO_IMAGE_FILE = "current_image.jpg"  # written inside the per-run temp dir
 WAKE_WORD_MODEL = "./wakeword.onnx"
+# Files holding the API key or conversation transcripts: owner read/write only
+PRIVATE_FILES = [".env", MEMORY_FILE, "agent.log"]
 
 DEFAULT_CONFIG = {
     "text_model": "claude-haiku-4-5",
@@ -83,31 +134,163 @@ DEFAULT_CONFIG = {
     "input_device": None,
     "input_sample_rate": None,
     # Most recent chat messages resent to Claude each turn (user + assistant).
-    "max_history_messages": 20
+    "max_history_messages": 20,
+    # The camera tool is offered to Claude only on turns where the user says one
+    # of these (whole words/phrases; case and punctuation ignored). [] = never.
+    "camera_trigger_words": [
+        "see", "seeing", "look", "looking", "looks", "photo", "photograph",
+        "picture", "pic", "snapshot", "selfie", "camera", "view",
+        "what is this", "what's this", "what am i holding", "describe this"
+    ],
+    # Sampling temperature, 0.0-1.0. null omits it (required for Claude 5.x
+    # models such as claude-haiku-5-5, which reject non-default values).
+    "temperature": 0.7,
+    # Thinking effort: "low", "medium" or "high". null omits it (required for
+    # claude-haiku-4-5, which rejects it). "low" keeps 5.x voice replies fast.
+    "effort": None
 }
 
 # LLM SETTINGS
-LLM_TEMPERATURE = 0.7
-LLM_TOP_P = 0.9
 MAX_TOOL_ROUNDS = 5
 TTS_MIN_SENTENCE_LENGTH = 80
 
+# Keys that also accept null, with the types accepted otherwise. Every other key
+# must match the type of its DEFAULT_CONFIG value.
+NULLABLE_CONFIG_TYPES = {
+    "input_device": (int, str),
+    "input_sample_rate": (int,),
+    "temperature": (float,),
+    "effort": (str,),
+}
+
+# Allowed ranges, checked after the type check: (predicate, description).
+CONFIG_RANGES = {
+    "wake_word_threshold": (lambda v: 0 < v <= 1, "greater than 0 and at most 1"),
+    "wake_word_consecutive": (lambda v: v >= 1, "at least 1"),
+    "max_history_messages": (lambda v: v >= 2, "at least 2"),
+    "whisper_threads": (lambda v: 1 <= v <= 8, "between 1 and 8"),
+    "camera_rotation": (lambda v: v in (0, 90, 180, 270), "one of 0, 90, 180, 270"),
+    "audio_energy_threshold": (lambda v: v >= 0, "0 or more"),
+    "silence_threshold": (lambda v: v >= 0, "0 or more"),
+    "input_sample_rate": (lambda v: v > 0, "a positive number"),
+    "temperature": (lambda v: 0.0 <= v <= 1.0, "between 0.0 and 1.0, or null"),
+    "effort": (lambda v: v in ("low", "medium", "high"), '"low", "medium", "high", or null'),
+}
+
+def _coerce_config_value(key, value, expected):
+    """Return value as the expected type, or raise ValueError."""
+    if expected is bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+            coerced = value.strip().lower() == "true"
+            log.warning(f"[CONFIG] WARNING: '{key}' is the string {value!r}; treating it as "
+                  f"{str(coerced).lower()}. Write it without quotes.")
+            return coerced
+        raise ValueError("expected true or false")
+    if isinstance(value, bool):
+        # bool is a subclass of int; true/false is never a valid number here
+        raise ValueError("expected a number, not true/false")
+    if expected is int:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        raise ValueError("expected a whole number")
+    if expected is float:
+        if isinstance(value, (int, float)):
+            return float(value)
+        raise ValueError("expected a number")
+    if expected is str:
+        if isinstance(value, str):
+            return value
+        raise ValueError("expected a string")
+    if expected is list:
+        if isinstance(value, list) and all(isinstance(v, str) for v in value):
+            return value
+        raise ValueError("expected a list of strings")
+    raise ValueError(f"unsupported type {expected.__name__}")
+
+def validate_config(user_cfg):
+    """Return the valid entries of user_cfg; warn about and drop everything else."""
+    unknown = sorted(k for k in user_cfg if k not in DEFAULT_CONFIG)
+    if unknown:
+        log.warning(f"[CONFIG] WARNING: ignoring unknown key(s) in {CONFIG_FILE} "
+              f"(typo?): {', '.join(unknown)}")
+
+    valid = {}
+    for key, value in user_cfg.items():
+        if key not in DEFAULT_CONFIG:
+            continue
+        default = DEFAULT_CONFIG[key]
+        try:
+            if key in NULLABLE_CONFIG_TYPES and value is None:
+                valid[key] = None
+                continue
+            errors = []
+            for expected in NULLABLE_CONFIG_TYPES.get(key, (type(default),)):
+                try:
+                    coerced = _coerce_config_value(key, value, expected)
+                    break
+                except ValueError as e:
+                    errors.append(str(e))
+            else:
+                raise ValueError(" or ".join(errors))
+            check = CONFIG_RANGES.get(key)
+            if check and not check[0](coerced):
+                raise ValueError(f"must be {check[1]}")
+        except ValueError as e:
+            log.warning(f"[CONFIG] WARNING: invalid '{key}': {value!r} ({e}); "
+                  f"using default {default!r}")
+            continue
+        valid[key] = coerced
+    return valid
+
 def load_config():
     config = DEFAULT_CONFIG.copy()
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r") as f:
-                user_config = json.load(f)
-                config.update(user_config)
-        except Exception as e:
-            print(f"Config Error: {e}. Using defaults.")
+    if not os.path.exists(CONFIG_FILE):
+        return config
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            user_config = json.load(f)
+    except (OSError, ValueError) as e:  # json.JSONDecodeError is a ValueError
+        user_config = e
+    if not isinstance(user_config, dict):
+        reason = user_config if isinstance(user_config, Exception) else \
+            f"top level is a {type(user_config).__name__}, not an object"
+        log.error("!" * 72)
+        log.error(f"[CONFIG] ERROR: {CONFIG_FILE} is unusable: {reason}")
+        log.error("[CONFIG] ERROR: IGNORING THE WHOLE FILE. Every setting is at its default.")
+        log.error("!" * 72)
+        return config
+    config.update(validate_config(user_config))
     return config
 
 CURRENT_CONFIG = load_config()
 TEXT_MODEL = os.environ.get("ANTHROPIC_MODEL", CURRENT_CONFIG["text_model"])
 WAKE_WORD_THRESHOLD = CURRENT_CONFIG["wake_word_threshold"]
-WAKE_WORD_CONSECUTIVE = max(1, int(CURRENT_CONFIG["wake_word_consecutive"]))
-MAX_HISTORY_MESSAGES = max(2, int(CURRENT_CONFIG["max_history_messages"]))
+WAKE_WORD_CONSECUTIVE = CURRENT_CONFIG["wake_word_consecutive"]
+MAX_HISTORY_MESSAGES = CURRENT_CONFIG["max_history_messages"]
+CHAT_MEMORY_ENABLED = CURRENT_CONFIG["chat_memory"]
+
+# Optional request parameters, passed to every Claude call. A null config value
+# leaves the parameter out so the model's own default applies.
+LLM_KWARGS = {}
+if CURRENT_CONFIG["temperature"] is not None:
+    LLM_KWARGS["temperature"] = CURRENT_CONFIG["temperature"]
+if CURRENT_CONFIG["effort"] is not None:
+    LLM_KWARGS["output_config"] = {"effort": CURRENT_CONFIG["effort"]}
+
+def restrict_private_files():
+    """chmod 600 any existing file that may hold the API key or transcripts."""
+    for name in PRIVATE_FILES:
+        path = BASE_DIR / name
+        try:
+            if path.exists() and stat.S_IMODE(path.stat().st_mode) != 0o600:
+                os.chmod(path, 0o600)
+                log.info(f"[INIT] Restricted permissions on {name} to 600")
+        except OSError as e:
+            log.warning(f"[WARN] Could not restrict permissions on {name}: {e}")
 
 # whisper.cpp prefixes every segment with "[hh:mm:ss.mmm --> hh:mm:ss.mmm]".
 # Match only that prefix so bracketed non-speech markers survive intact.
@@ -125,8 +308,14 @@ WHISPER_HALLUCINATIONS = {
     "please subscribe", "subtitles by the amara.org community",
 }
 
-# Anthropic client — reads ANTHROPIC_API_KEY from environment / .env
-llm_client = anthropic.Anthropic()
+# Memory wipe fires only when the *whole* utterance is the command, so
+# "don't forget everything" never wipes anything. Matched after normalize.
+MEMORY_WIPE_RE = re.compile(r"^(?:please\s+)?(?:forget everything|reset (?:your )?memory)(?:\s+please)?$")
+
+# Anthropic client — reads ANTHROPIC_API_KEY from environment / .env.
+# The SDK default timeout is 10 minutes; 60s bounds each request (and each
+# idle gap between streamed chunks) so a dead network can't hang a turn.
+llm_client = anthropic.Anthropic(timeout=60.0, max_retries=2)
 
 def resolve_input_device(config):
     requested = config.get("input_device")
@@ -136,14 +325,14 @@ def resolve_input_device(config):
     try:
         devices = sd.query_devices()
     except Exception as e:
-        print(f"[AUDIO] Device query failed: {e}", flush=True)
+        log.warning(f"[AUDIO] Device query failed: {e}")
         return None
 
     if isinstance(requested, int) or (isinstance(requested, str) and requested.isdigit()):
         index = int(requested)
         if 0 <= index < len(devices):
             return index
-        print(f"[AUDIO] Input device index not found: {index}", flush=True)
+        log.warning(f"[AUDIO] Input device index not found: {index}")
         return None
 
     requested_lower = str(requested).lower()
@@ -151,16 +340,16 @@ def resolve_input_device(config):
         if dev.get("max_input_channels", 0) > 0 and requested_lower in dev.get("name", "").lower():
             return idx
 
-    print(f"[AUDIO] Input device name not found: {requested}", flush=True)
+    log.warning(f"[AUDIO] Input device name not found: {requested}")
     return None
 
 INPUT_DEVICE_NAME = resolve_input_device(CURRENT_CONFIG)
 if INPUT_DEVICE_NAME is not None:
     try:
         device_info = sd.query_devices(INPUT_DEVICE_NAME)
-        print(f"[AUDIO] Using input device: {device_info.get('name', INPUT_DEVICE_NAME)}", flush=True)
+        log.info(f"[AUDIO] Using input device: {device_info.get('name', INPUT_DEVICE_NAME)}")
     except Exception:
-        print(f"[AUDIO] Using input device index: {INPUT_DEVICE_NAME}", flush=True)
+        log.info(f"[AUDIO] Using input device index: {INPUT_DEVICE_NAME}")
 
 def choose_input_samplerate(device, preferred=None):
     """Pick a sample rate the input device actually supports."""
@@ -172,7 +361,7 @@ def choose_input_samplerate(device, preferred=None):
         if "default_samplerate" in device_info:
             candidates.append(int(device_info["default_samplerate"]))
     except Exception as e:
-        print(f"[AUDIO] Input device query failed: {e}", flush=True)
+        log.warning(f"[AUDIO] Input device query failed: {e}")
 
     candidates.extend([48000, 44100, 32000, 16000])
     seen = set()
@@ -202,9 +391,10 @@ BASE_SYSTEM_PROMPT = """You are a helpful robot assistant running on a Raspberry
 Personality: Cute, helpful, robot.
 Style: Short sentences. Enthusiastic.
 
-You have real tools: you can check the time, search the web, and take a photo
-with your camera to see your surroundings. Use a tool whenever the user asks
-for something a tool provides; otherwise just chat.
+You have real tools: you can check the time and search the web. When the user
+asks you to look at or see something, you can also take a photo with your
+camera (that tool is only offered on those turns). Use a tool whenever the
+user asks for something a tool provides; otherwise just chat.
 
 Your replies are spoken aloud, so keep them short and conversational.
 """
@@ -236,6 +426,48 @@ TOOLS = [
     }
 ]
 
+def normalize_words(text):
+    """Lowercase, drop punctuation, collapse whitespace: "What's THIS?" -> "whats this"."""
+    return " ".join(re.sub(r"[^\w\s]", "", text.lower()).split())
+
+def build_trigger_re(phrases):
+    """Whole-word/phrase matcher for normalized text, or None if phrases is empty."""
+    phrases = sorted({p for p in map(normalize_words, phrases) if p}, key=len, reverse=True)
+    if not phrases:
+        return None
+    return re.compile(r"\b(?:" + "|".join(re.escape(p) for p in phrases) + r")\b")
+
+# The camera tool is offered only on turns where the user asked to look at
+# something, so a misheard phrase, a TV in the room, or text planted in a
+# search result can't make Claude take a photo.
+CAMERA_TRIGGER_RE = build_trigger_re(CURRENT_CONFIG["camera_trigger_words"])
+TOOLS_WITHOUT_CAMERA = [t for t in TOOLS if t["name"] != "capture_image"]
+
+# Symbols Piper can't read, spelled out before speak() strips non-speech
+# characters. Applied in order: "$12.50" must match before a bare "$".
+TTS_SYMBOL_SUBS = [
+    (re.compile(r"[‘’ʼ]"), "'"),  # curly apostrophes -> '
+    (re.compile(r"\$\s*(\d(?:[\d,]*\d)?(?:\.\d+)?)"), r"\1 dollars"),
+    (re.compile(r"\$"), " dollars "),
+    (re.compile(r"%"), " percent"),
+    (re.compile(r"\s*°\s*C\b"), " degrees celsius"),
+    (re.compile(r"\s*°\s*F\b"), " degrees fahrenheit"),
+    (re.compile(r"\s*°"), " degrees"),
+    (re.compile(r"&"), " and "),
+    (re.compile(r"\+"), " plus "),
+    (re.compile(r"="), " equals "),
+    (re.compile(r"(?<=\d)\s*/\s*(?=\d)"), " slash "),
+    (re.compile(r"/"), " "),  # and/or -> "and or", not "andor"
+    (re.compile(r"#(?=\d)"), " number "),
+]
+
+def normalize_for_tts(text):
+    """Make text speakable: spell out symbols, then drop emoji and other non-speech characters."""
+    for pattern, replacement in TTS_SYMBOL_SUBS:
+        text = pattern.sub(replacement, text)
+    text = re.sub(r"[^\w\s,.!?:'-]", "", text)
+    return re.sub(r"[ \t]+", " ", text).strip()
+
 # Sound Directories
 greeting_sounds_dir = "sounds/greeting_sounds"
 ack_sounds_dir = "sounds/ack_sounds"
@@ -259,15 +491,26 @@ class BotGUI:
         # Inputs
         master.bind('<Return>', self.handle_ptt_toggle)
         master.bind('<space>', self.handle_speaking_interrupt)
+
+        # Per-run scratch space for input.wav and camera photos; removed in safe_exit
+        self.tmp_dir = tempfile.mkdtemp(prefix="be-more-agent-")
+        self.memory_lock = threading.Lock()
+
         atexit.register(self.safe_exit)
+        # SIGTERM (systemd stop, shutdown) and SIGINT (Ctrl+C) take the same
+        # save-and-quit path. Python runs these on the main (tkinter) thread
+        # the next time it executes bytecode, which the animation timer
+        # guarantees at least every 500ms.
+        signal.signal(signal.SIGTERM, self._handle_exit_signal)
+        signal.signal(signal.SIGINT, self._handle_exit_signal)
         
         # State
         self.current_state = BotStates.WARMUP
-        self.current_volume = 0 
         self.animations = {}
         self.current_frame_index = 0
         self.current_overlay_image = None
         
+        log.info(f"[INIT] Persistent chat memory: {'ON' if CHAT_MEMORY_ENABLED else 'OFF'}")
         self.permanent_memory = self.load_chat_history()
         self.session_memory = []
         self.thinking_sound_active = threading.Event()
@@ -283,34 +526,41 @@ class BotGUI:
         self.tts_active = threading.Event()
         self.exiting = False
         self.turn_cam_path = None
+        self.llm_ready = False
+        # True while the text box ends in an unfinished "BOT: ..." line. Only
+        # the main-loop thread appends conversation text, so it owns this flag.
+        self._bot_line_open = False
+        # Worker threads must not touch Tk directly: they queue zero-arg
+        # callables here and _process_ui_queue runs them on the Tk thread.
+        self.ui_queue = queue.Queue()
 
         # --- PIPER TTS INITIALIZATION ---
-        print("[INIT] Loading Piper voice...", flush=True)
+        log.info("[INIT] Loading Piper voice...")
         self.piper_voice = None
         voice_model = CURRENT_CONFIG.get("voice_model", "piper/en_US-bmo-medium.onnx")
         try:
             self.piper_voice = PiperVoice.load(voice_model)
-            print(f"[INIT] Piper voice loaded: {voice_model}", flush=True)
+            log.info(f"[INIT] Piper voice loaded: {voice_model}")
         except Exception as e:
-            print(f"[CRITICAL] Failed to load Piper voice '{voice_model}': {e}")
+            log.error(f"[CRITICAL] Failed to load Piper voice '{voice_model}': {e}")
 
         # --- WAKE WORD INITIALIZATION ---
-        print("[INIT] Loading Wake Word...", flush=True)
+        log.info("[INIT] Loading Wake Word...")
         self.oww_model = None
         if os.path.exists(WAKE_WORD_MODEL):
             try:
                 self.oww_model = Model(wakeword_model_paths=[WAKE_WORD_MODEL])
-                print("[INIT] Wake Word Loaded.", flush=True)
+                log.info("[INIT] Wake Word Loaded.")
             except TypeError:
                 try:
                     self.oww_model = Model(wakeword_models=[WAKE_WORD_MODEL])
-                    print("[INIT] Wake Word Loaded (New API).", flush=True)
+                    log.info("[INIT] Wake Word Loaded (New API).")
                 except Exception as e:
-                    print(f"[CRITICAL] Failed to load model: {e}")
+                    log.error(f"[CRITICAL] Failed to load model: {e}")
             except Exception as e:
-                print(f"[CRITICAL] Failed to load model: {e}")
+                log.error(f"[CRITICAL] Failed to load model: {e}")
         else:
-            print(f"[CRITICAL] Model not found: {WAKE_WORD_MODEL}")
+            log.error(f"[CRITICAL] Model not found: {WAKE_WORD_MODEL}")
 
         # GUI Setup
         self.background_label = tk.Label(master)
@@ -329,8 +579,9 @@ class BotGUI:
         self.exit_button = ttk.Button(master, text="Exit & Save", command=self.safe_exit)
 
         self.load_animations()
-        self.update_animation() 
-        
+        self.update_animation()
+        self._process_ui_queue()
+
         threading.Thread(target=self.safe_main_execution, daemon=True).start()
 
     # --- HELPERS ---
@@ -340,7 +591,7 @@ class BotGUI:
         if self.exiting:
             return
         self.exiting = True
-        print("\n--- SHUTDOWN SEQUENCE ---", flush=True)
+        log.info("--- SHUTDOWN SEQUENCE ---")
         self.recording_active.clear()
         self.thinking_sound_active.clear()
         self.tts_active.clear()
@@ -351,11 +602,54 @@ class BotGUI:
             sd.stop()
         except Exception:
             pass
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
         try:
             self.master.quit()
         except Exception:
             pass
-        
+
+    def _handle_exit_signal(self, signum, frame):
+        log.info(f"[SIGNAL] Received {signal.Signals(signum).name}")
+        self.safe_exit()
+        # quit() is a no-op if the signal landed before mainloop() started
+        # (e.g. Ctrl+C while Piper loads); queue one more so it exits on entry
+        try:
+            self.master.after(0, self.master.quit)
+        except Exception:
+            pass
+
+    def _remove_file(self, path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    def _ui(self, fn, *args):
+        """Run fn(*args) on the Tk thread. Safe to call from any thread; FIFO."""
+        self.ui_queue.put(lambda: fn(*args))
+
+    def _process_ui_queue(self):
+        # Tk thread only: drain everything queued since the last pass
+        while True:
+            try:
+                fn = self.ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except tk.TclError:
+                if self.exiting:
+                    return  # widgets are being torn down
+                log.exception("[UI] Update failed")
+            except Exception:
+                log.exception("[UI] Update failed")
+        if self.exiting:
+            return
+        try:
+            self.master.after(30, self._process_ui_queue)
+        except tk.TclError:
+            pass  # window destroyed
+
     def exit_fullscreen(self, event=None):
         self.master.attributes('-fullscreen', False)
         self.safe_exit()
@@ -379,15 +673,17 @@ class BotGUI:
         self.last_ptt_time = current_time
 
         if self.recording_active.is_set():
-            print("[PTT] Toggle OFF", flush=True)
+            log.info("[PTT] Toggle OFF")
             self.recording_active.clear() 
         else:
             if self.current_state == BotStates.IDLE or "Wait" in self.status_var.get():
-                print("[PTT] Toggle ON", flush=True)
+                log.info("[PTT] Toggle ON")
                 self.recording_active.set() 
                 self.ptt_event.set()
 
     def handle_speaking_interrupt(self, event=None):
+        # current_state is written by the main-loop thread; reading one
+        # attribute is atomic in CPython, and a stale value only skips a press.
         if self.current_state == BotStates.SPEAKING or self.current_state == BotStates.THINKING:
             self.interrupted.set()
             self.thinking_sound_active.clear()
@@ -411,8 +707,9 @@ class BotGUI:
                     img = Image.open(os.path.join(folder, f)).resize((self.BG_WIDTH, self.BG_HEIGHT))
                     self.animations[state].append(ImageTk.PhotoImage(img))
             if not self.animations[state]:
-                if state in self.animations.get("idle", []):
-                     self.animations[state] = self.animations["idle"]
+                # No images for this state: reuse the idle animation if it loaded
+                if self.animations.get("idle"):
+                    self.animations[state] = self.animations["idle"]
                 else:
                     # Blue screen fallback
                     blank = Image.new('RGB', (self.BG_WIDTH, self.BG_HEIGHT), color='#0000FF')
@@ -438,10 +735,16 @@ class BotGUI:
         self.master.after(speed, self.update_animation)
 
     def set_state(self, state, msg="", cam_path=None):
+        # current_state changes immediately on the calling thread, because the
+        # worker reads it right after this call; only the drawing is queued.
+        # update_animation() takes the frame index modulo the new frame count,
+        # so it is safe for it to see the new state before _update runs.
+        if msg: log.info(f"[STATE] {state.upper()}: {msg}")
+        changed = self.current_state != state
+        self.current_state = state
+
         def _update():
-            if msg: print(f"[STATE] {state.upper()}: {msg}", flush=True)
-            if self.current_state != state:
-                self.current_state = state
+            if changed:
                 self.current_frame_index = 0
             if msg: self.status_var.set(msg)
             if cam_path and os.path.exists(cam_path) and state in [BotStates.THINKING, BotStates.SPEAKING]:
@@ -450,31 +753,38 @@ class BotGUI:
                     self.current_overlay_image = ImageTk.PhotoImage(img)
                     self.overlay_label.config(image=self.current_overlay_image)
                     self.overlay_label.place(x=200, y=90)
-                except: pass
+                except Exception as e:
+                    log.warning(f"[UI] Could not show camera overlay: {e}")
             else:
                 self.overlay_label.place_forget()
-        self.master.after(0, _update)
+        self._ui(_update)
 
     def append_to_text(self, text, newline=True):
         def _update():
             self.response_text.config(state=tk.NORMAL)
-            if newline: 
+            if newline:
                 self.response_text.insert(tk.END, text + "\n")
-            else: 
+            else:
                 self.response_text.insert(tk.END, text)
-            
+
             self.response_text.see(tk.END)
             self.response_text.config(state=tk.DISABLED)
-            
-        self.master.after(0, _update)
+
+        self._ui(_update)
+
+    def _end_bot_line(self):
+        """Terminate the "BOT: ..." line, if one is open. Main-loop thread only."""
+        if self._bot_line_open:
+            self.append_to_text("")
+            self._bot_line_open = False
 
     def _stream_to_text(self, chunk):
         def update_text_stream():
             self.response_text.config(state=tk.NORMAL)
             self.response_text.insert(tk.END, chunk)
-            self.response_text.see(tk.END) 
+            self.response_text.see(tk.END)
             self.response_text.config(state=tk.DISABLED)
-        self.master.after(0, update_text_stream)
+        self._ui(update_text_stream)
 
     # =========================================================================
     # 3. TOOL EXECUTION
@@ -482,7 +792,7 @@ class BotGUI:
 
     def execute_tool(self, name, tool_input):
         """Run a tool requested by Claude and return tool_result content."""
-        print(f"TOOL: {name} {tool_input}", flush=True)
+        log.info(f"TOOL: {name} {tool_input}")
 
         if name == "get_time":
             now = datetime.datetime.now().strftime("%I:%M %p")
@@ -490,7 +800,7 @@ class BotGUI:
 
         if name == "search_web":
             query = tool_input.get("query", "")
-            print(f"Searching web for: {query}...", flush=True)
+            log.info(f"Searching web for: {query}...")
             try:
                 # 'us-en' region is often more stable for CLI queries
                 with DDGS() as ddgs:
@@ -499,19 +809,19 @@ class BotGUI:
                     try:
                         results = list(ddgs.news(query, region='us-en', max_results=1))
                         if results:
-                            print(f"[DEBUG] Found News: {results[0].get('title')}", flush=True)
+                            log.debug(f"[SEARCH] Found News: {results[0].get('title')}")
                     except Exception as e:
-                        print(f"[DEBUG] News Search Error: {e}", flush=True)
+                        log.warning(f"[SEARCH] News Search Error: {e}")
 
                     # 2. Text fallback
                     if not results:
-                        print("[DEBUG] No news found, trying text search...", flush=True)
+                        log.debug("[SEARCH] No news found, trying text search...")
                         try:
                             results = list(ddgs.text(query, region='us-en', max_results=1))
                             if results:
-                                print(f"[DEBUG] Found Text: {results[0].get('title')}", flush=True)
+                                log.debug(f"[SEARCH] Found Text: {results[0].get('title')}")
                         except Exception as e:
-                             print(f"[DEBUG] Text Search Error: {e}", flush=True)
+                             log.warning(f"[SEARCH] Text Search Error: {e}")
 
                     if results:
                         r = results[0]
@@ -520,10 +830,10 @@ class BotGUI:
                         body = r.get('body', r.get('snippet', 'No Body'))
                         return f"SEARCH RESULTS for '{query}':\nTitle: {title}\nSnippet: {body[:300]}"
                     else:
-                        print(f"[DEBUG] Search returned 0 results.", flush=True)
+                        log.info("[SEARCH] Search returned 0 results.")
                         return "The search returned no results."
             except Exception as e:
-                print(f"[DEBUG] Connection/Library Error: {e}", flush=True)
+                log.error(f"[SEARCH] Connection/Library Error: {e}")
                 return "Search failed: the internet is unreachable right now."
 
         if name == "capture_image":
@@ -538,7 +848,7 @@ class BotGUI:
                 "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}
             }]
 
-        return f"Unknown tool: {name}"
+        return f"Error: unknown tool '{name}'. Available tools: get_time, search_web, capture_image."
 
     # =========================================================================
     # 4. CORE LOGIC
@@ -570,7 +880,11 @@ class BotGUI:
                     self.set_state(BotStates.IDLE, "Heard nothing.")
                     continue
                 
-                user_text = self.transcribe_audio(audio_file)
+                try:
+                    user_text = self.transcribe_audio(audio_file)
+                finally:
+                    # The recording is only needed for whisper; don't leave it on disk
+                    self._remove_file(audio_file)
                 if not user_text:
                     self.set_state(BotStates.IDLE, "Transcription empty.")
                     continue
@@ -580,21 +894,33 @@ class BotGUI:
                 self.chat_and_respond(user_text)
                     
         except Exception as e:
-            traceback.print_exc()
+            log.exception("[CRITICAL] Main loop crashed")
             self.set_state(BotStates.ERROR, f"Fatal Error: {str(e)[:40]}")
 
     def warm_up_logic(self):
         self.set_state(BotStates.WARMUP, "Warming up brains...")
         try:
+            # Reachability check. Same optional params as a real turn, so a model
+            # that rejects them fails here, at startup. max_tokens leaves room for
+            # models that think by default (thinking counts toward the cap).
             llm_client.messages.create(
-                model=TEXT_MODEL, max_tokens=1,
-                messages=[{"role": "user", "content": "hi"}]
+                model=TEXT_MODEL, max_tokens=32,
+                messages=[{"role": "user", "content": "hi"}], **LLM_KWARGS
             )
-            print(f"Anthropic API is reachable. Model: {TEXT_MODEL}", flush=True)
+            log.info(f"Anthropic API is reachable. Model: {TEXT_MODEL}")
+            self.llm_ready = True
         except Exception as e:
-            print(f"Failed to reach Anthropic API: {e}", flush=True)
+            log.error(f"Failed to reach Anthropic API: {e}")
+            self.llm_ready = False
+            # Make the failure visible and audible instead of greeting as if all
+            # is well. The main loop still starts, so PTT keeps working and a
+            # failed turn shows "Brain Freeze!" as usual.
+            self.set_state(BotStates.ERROR, "Can't reach Claude: check API key / network")
+            self.play_sound(self.get_random_sound(error_sounds_dir))
+            time.sleep(3)
+            return
         self.play_sound(self.get_random_sound(greeting_sounds_dir))
-        print("Ready.", flush=True)
+        log.info("Ready.")
 
     def detect_wake_word_or_ptt(self):
         self.set_state(BotStates.IDLE, "Waiting...")
@@ -625,7 +951,7 @@ class BotGUI:
         try:
             return self._listen_loop(stream_args, input_chunk_size, CHUNK_SIZE, use_resampling)
         except Exception as e:
-            print(f"[AUDIO] Wake stream failed: {e}. Retrying with fallback settings...", flush=True)
+            log.warning(f"[AUDIO] Wake stream failed: {e}. Retrying with fallback settings...")
             try:
                 # Only the stream buffering changes; keep reading a full 80ms
                 # frame and resampling exactly as computed above.
@@ -633,14 +959,14 @@ class BotGUI:
                 stream_args["latency"] = "high"
                 return self._listen_loop(stream_args, input_chunk_size, CHUNK_SIZE, use_resampling)
             except Exception as e2:
-                print(f"[CRITICAL] Wake Word Stream Error: {e2}", flush=True)
+                log.error(f"[CRITICAL] Wake Word Stream Error: {e2}")
                 self.ptt_event.wait()
                 self.ptt_event.clear()
                 return "PTT"
 
     def _listen_loop(self, stream_args, input_chunk_size, target_chunk_size, use_resampling):
         with sd.InputStream(**stream_args) as stream:
-            print(f"[AUDIO] Listening at {stream_args['samplerate']} Hz, block {stream_args['blocksize']}", flush=True)
+            log.info(f"[AUDIO] Listening at {stream_args['samplerate']} Hz, block {stream_args['blocksize']}")
             consecutive_overflows = 0
             try:
                 stdin_is_interactive = sys.stdin is not None and sys.stdin.isatty()
@@ -665,11 +991,13 @@ class BotGUI:
 
                 data, overflow = stream.read(input_chunk_size)
                 if overflow:
-                    print("!", end="", flush=True)
+                    # Counted, not logged per read; the caller logs the raise
                     consecutive_overflows += 1
                     if consecutive_overflows >= 5:
-                        raise RuntimeError("Persistent audio buffer overflow")
+                        raise RuntimeError(f"Persistent audio buffer overflow ({consecutive_overflows} reads in a row)")
                 else:
+                    if consecutive_overflows:
+                        log.warning(f"[AUDIO] Input overflowed on {consecutive_overflows} read(s), then recovered")
                     consecutive_overflows = 0
 
                 audio_data = np.frombuffer(data, dtype=np.int16)
@@ -697,12 +1025,13 @@ class BotGUI:
                     if len(recent) < WAKE_WORD_CONSECUTIVE:
                         continue
                     if all(score > WAKE_WORD_THRESHOLD for score in recent):
-                        print(f"[WAKE] {mdl} triggered ({max(recent):.2f})", flush=True)
+                        log.info(f"[WAKE] {mdl} triggered ({max(recent):.2f})")
                         self.oww_model.reset()
                         return "WAKE"
 
-    def record_voice_adaptive(self, filename="input.wav"):
-        print("Recording (Adaptive)...", flush=True)
+    def record_voice_adaptive(self, filename=None):
+        filename = filename or os.path.join(self.tmp_dir, "input.wav")
+        log.info("Recording (Adaptive)...")
         time.sleep(0.5)
         samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
 
@@ -758,13 +1087,14 @@ class BotGUI:
                 while not silence_started and recorded_chunks < max_chunks:
                     sd.sleep(int(chunk_duration * 1000))
         except Exception as e:
-            print(f"[AUDIO ERROR] Adaptive Recording Failed: {e}", flush=True)
+            log.error(f"[AUDIO ERROR] Adaptive Recording Failed: {e}")
             return None
 
         return self.save_audio_buffer(buffer, filename, samplerate)
 
-    def record_voice_ptt(self, filename="input.wav"):
-        print("Recording (PTT)...", flush=True)
+    def record_voice_ptt(self, filename=None):
+        filename = filename or os.path.join(self.tmp_dir, "input.wav")
+        log.info("Recording (PTT)...")
         time.sleep(0.5)
         samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
 
@@ -779,7 +1109,7 @@ class BotGUI:
             with sd.InputStream(samplerate=samplerate, channels=1, callback=callback, device=INPUT_DEVICE_NAME):
                 while self.recording_active.is_set(): sd.sleep(50)
         except Exception as e:
-            print(f"[AUDIO ERROR] PTT Recording Failed: {e}", flush=True)
+            log.error(f"[AUDIO ERROR] PTT Recording Failed: {e}")
             return None
 
         return self.save_audio_buffer(buffer, filename, samplerate)
@@ -788,7 +1118,8 @@ class BotGUI:
         if not buffer: return None
         audio_data = np.concatenate(buffer, axis=0).flatten()
         audio_data = np.nan_to_num(audio_data, nan=0.0, posinf=0.0, neginf=0.0)
-        audio_data = (audio_data * 32767).astype(np.int16)
+        # Clip first: samples beyond +/-1.0 would wrap around in int16
+        audio_data = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16)
         with wave.open(filename, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
@@ -805,10 +1136,10 @@ class BotGUI:
                 data = wf.readframes(wf.getnframes())
             audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
             rms = np.sqrt(np.mean(audio ** 2))
-            print(f"[AUDIO] RMS energy: {rms:.6f} (threshold: {threshold})", flush=True)
+            log.info(f"[AUDIO] RMS energy: {rms:.6f} (threshold: {threshold})")
             return rms >= threshold
         except Exception as e:
-            print(f"[AUDIO] Energy check failed: {e}", flush=True)
+            log.warning(f"[AUDIO] Energy check failed: {e}")
             return True  # transcribe on error to be safe
 
     def _is_speech(self, transcription):
@@ -824,52 +1155,63 @@ class BotGUI:
         # Drop bracketed annotations; if nothing survives, it was pure non-speech.
         residue = NON_SPEECH_MARKER_RE.sub("", transcription)
         if not re.search(r"[A-Za-z0-9]", residue):
-            print("[AUDIO] Non-speech audio — ignoring.", flush=True)
+            log.info("[AUDIO] Non-speech audio — ignoring.")
             return False
 
         normalized = re.sub(r"[^a-z0-9 ]", "", residue.lower()).strip()
         if normalized in WHISPER_HALLUCINATIONS:
-            print(f"[AUDIO] Silence hallucination '{transcription}' — ignoring.", flush=True)
+            log.info(f"[AUDIO] Silence hallucination '{transcription}' — ignoring.")
             return False
 
         return True
 
     def transcribe_audio(self, filename):
         if not self._check_audio_energy(filename):
-            print("[AUDIO] Skipping transcription — audio too quiet.", flush=True)
+            log.info("[AUDIO] Skipping transcription — audio too quiet.")
             return ""
 
-        print("Transcribing...", flush=True)
+        log.info("Transcribing...")
         whisper_model = CURRENT_CONFIG.get("whisper_model", "./whisper.cpp/models/ggml-base.en.bin")
         whisper_threads = str(CURRENT_CONFIG.get("whisper_threads", 3))
         try:
             result = subprocess.run(
                 ["./whisper.cpp/build/bin/whisper-cli", "-m", whisper_model, "-l", "en", "-t", whisper_threads, "-f", filename],
-                capture_output=True, text=True
+                capture_output=True, text=True, timeout=90
             )
+            if result.returncode != 0:
+                log.error(f"Transcription Error: whisper-cli exited {result.returncode}: {result.stderr.strip()[-300:]}")
+                return ""
             # whisper-cli prints one timestamped line per segment; join them all
             segments = [WHISPER_TIMESTAMP_RE.sub("", line).strip() for line in result.stdout.split('\n')]
             transcription = " ".join(seg for seg in segments if seg)
-            print(f"Heard: '{transcription}'", flush=True)
+            log.info(f"Heard: '{transcription}'")
             if not self._is_speech(transcription):
                 return ""
             return transcription.strip()
+        except subprocess.TimeoutExpired:
+            log.error("Transcription Error: whisper-cli timed out after 90s")
+            return ""
         except Exception as e:
-            print(f"Transcription Error: {e}")
+            log.error(f"Transcription Error: {e}")
             return ""
 
     def capture_image(self):
         self.set_state(BotStates.CAPTURING, "Watching...")
+        img_path = os.path.join(self.tmp_dir, BMO_IMAGE_FILE)
         try:
-            subprocess.run(["rpicam-still", "-t", "500", "-n", "--width", "640", "--height", "480", "-o", BMO_IMAGE_FILE], check=True)
+            subprocess.run(["rpicam-still", "-t", "500", "-n", "--width", "640", "--height", "480", "-o", img_path],
+                           check=True, timeout=20)
             rotation = CURRENT_CONFIG.get("camera_rotation", 0)
             if rotation != 0:
-                img = Image.open(BMO_IMAGE_FILE)
+                img = Image.open(img_path)
                 img = img.rotate(rotation, expand=True) 
-                img.save(BMO_IMAGE_FILE)
-            return BMO_IMAGE_FILE
+                img.save(img_path)
+            return img_path
+        except subprocess.TimeoutExpired:
+            log.error("Camera Error: rpicam-still timed out after 20s")
+            return None
         except Exception as e:
-            print(f"Camera Error: {e}")
+            log.error(f"Camera Error: {e}")
             return None
 
     # =========================================================================
@@ -895,7 +1237,8 @@ class BotGUI:
             except queue.Empty:
                 break
 
-        if "forget everything" in text.lower() or "reset memory" in text.lower():
+        normalized = normalize_words(text)
+        if MEMORY_WIPE_RE.match(normalized):
             self.session_memory = []
             self.permanent_memory = [{"role": "system", "content": SYSTEM_PROMPT}]
             self.save_chat_history()
@@ -910,6 +1253,15 @@ class BotGUI:
 
         messages = self._history_messages() + [{"role": "user", "content": text}]
 
+        # Decided once from the user's own words; the same tool list is used for
+        # every round below, so a tool result can't unlock the camera mid-turn.
+        if CAMERA_TRIGGER_RE and CAMERA_TRIGGER_RE.search(normalized):
+            turn_tools = TOOLS
+            log.info("[VISION] camera tool enabled for this turn")
+        else:
+            turn_tools = TOOLS_WITHOUT_CAMERA
+        turn_tool_names = {t["name"] for t in turn_tools}
+
         self._start_thinking_sound()
 
         full_response_text = ""
@@ -921,7 +1273,7 @@ class BotGUI:
 
                 with llm_client.messages.stream(
                     model=TEXT_MODEL, messages=messages, system=SYSTEM_PROMPT,
-                    tools=TOOLS, max_tokens=1024, temperature=LLM_TEMPERATURE
+                    tools=turn_tools, max_tokens=1024, **LLM_KWARGS
                 ) as stream:
                     for content in stream.text_stream:
                         if self.interrupted.is_set(): break
@@ -931,7 +1283,12 @@ class BotGUI:
                         self.thinking_sound_active.clear()
                         if self.current_state != BotStates.SPEAKING:
                             self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=self.turn_cam_path)
+                        # Tracked separately from current_state: a tool round
+                        # switches back to THINKING mid-reply, and that must
+                        # not start a second "BOT: " on the same line.
+                        if not self._bot_line_open:
                             self.append_to_text("BOT: ", newline=False)
+                            self._bot_line_open = True
 
                         self._stream_to_text(content)
 
@@ -961,11 +1318,31 @@ class BotGUI:
                 messages.append({"role": "assistant", "content": final_message.content})
                 tool_results = []
                 for block in final_message.content:
-                    if block.type == "tool_use":
+                    if block.type != "tool_use":
+                        continue
+                    if block.name not in turn_tool_names:
+                        log.warning(f"[TOOL] Refused {block.name}: not offered this turn")
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": f"Tool {block.name} is not available right now.",
+                            "is_error": True
+                        })
+                        continue
+                    try:
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
                             "content": self.execute_tool(block.name, block.input)
+                        })
+                    except Exception as e:
+                        # Report the failure to Claude instead of aborting the turn
+                        log.exception(f"[TOOL] {block.name} failed: {e!r}")
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": f"Tool {block.name} failed: {e}",
+                            "is_error": True
                         })
                 messages.append({"role": "user", "content": tool_results})
 
@@ -977,10 +1354,11 @@ class BotGUI:
             if not self.interrupted.is_set():
                 self.session_memory.append({"role": "user", "content": text})
                 if full_response_text.strip():
-                    self.append_to_text("")
                     self.session_memory.append({"role": "assistant", "content": full_response_text})
                 if len(self.session_memory) > MAX_HISTORY_MESSAGES:
                     del self.session_memory[:-MAX_HISTORY_MESSAGES]
+                self.save_chat_history()
+            self.llm_ready = True
 
             self.wait_for_tts()
             # Playback is finished; a spacebar interrupt of this response must
@@ -989,13 +1367,25 @@ class BotGUI:
             self.set_state(BotStates.IDLE, "Ready")
 
         except Exception as e:
-            print(f"LLM Error: {e}")
+            log.error(f"LLM Error: {e}")
             self.thinking_sound_active.clear()
             # Don't reopen the mic while queued speech is still playing,
             # or the bot records and answers its own voice
             self.wait_for_tts()
             self.interrupted.clear()
             self.set_state(BotStates.ERROR, "Brain Freeze!")
+
+        # Finish the reply's line on every exit path (done, interrupted, error)
+        # so the next "YOU:" starts on a line of its own.
+        self._end_bot_line()
+
+        # The photo overlay was built from this file. set_state() applies its
+        # updates through self.ui_queue, which runs callbacks FIFO, so
+        # deleting through the same queue happens only after every pending
+        # overlay update and the IDLE/ERROR state above have been applied.
+        if self.turn_cam_path:
+            cam_path, self.turn_cam_path = self.turn_cam_path, None
+            self._ui(self._remove_file, cam_path)
 
     def wait_for_tts(self):
         self.tts_queue.join()
@@ -1015,13 +1405,13 @@ class BotGUI:
             self.tts_queue.task_done()
 
     def speak(self, text):
-        clean = re.sub(r"[^\w\s,.!?:-]", "", text)
+        clean = normalize_for_tts(text)
         if not clean.strip(): return
         if self.piper_voice is None:
-            print("[PIPER] Voice not loaded; skipping playback.", flush=True)
+            log.warning("[PIPER] Voice not loaded; skipping playback.")
             return
 
-        print(f"[PIPER SPEAKING] '{clean}'", flush=True)
+        log.info(f"[PIPER SPEAKING] '{clean}'")
 
         try:
             device_info = sd.query_devices(kind='output')
@@ -1064,24 +1454,19 @@ class BotGUI:
                 for i in range(0, len(audio_bytes), byte_step):
                     if self.interrupted.is_set():
                         break
-                    sub = audio_bytes[i:i + byte_step]
-                    sub_arr = np.frombuffer(sub, dtype=np.int16)
-                    if len(sub_arr) > 0:
-                        self.current_volume = np.max(np.abs(sub_arr))
-                    stream.write(sub)
+                    stream.write(audio_bytes[i:i + byte_step])
 
             if stream is not None and not self.interrupted.is_set():
                 time.sleep(0.5)
 
         except Exception as e:
-            print(f"Audio Error: {e}")
+            log.error(f"Audio Error: {e}")
         finally:
-            self.current_volume = 0
             if stream is not None:
                 try: stream.stop()
-                except: pass
+                except Exception: pass  # best-effort cleanup
                 try: stream.close()
-                except: pass
+                except Exception: pass  # best-effort cleanup
 
     def _start_thinking_sound(self):
         # One loop thread at most: two threads calling sd.play() crash PortAudio
@@ -1138,8 +1523,8 @@ class BotGUI:
                 time.sleep(0.05)
                 remaining -= 0.05
             sd.wait()
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"[AUDIO] Could not play {file_path}: {e}")
 
     def get_random_sound(self, directory):
         if os.path.exists(directory):
@@ -1158,37 +1543,66 @@ class BotGUI:
             try:
                 device_info = sd.query_devices(kind='output')
                 native_rate = int(device_info['default_samplerate'])
-            except:
+            except Exception:
                 native_rate = 48000 
 
             playback_rate = file_sr
             try:
                 sd.check_output_settings(device=None, samplerate=file_sr)
-            except:
+            except Exception:
                 playback_rate = native_rate
                 num_samples = int(len(audio) * (native_rate / file_sr))
                 audio = scipy.signal.resample(audio, num_samples).astype(np.int16)
 
             sd.play(audio, playback_rate)
             sd.wait() 
-        except: pass
+        except Exception as e:
+            log.warning(f"[AUDIO] Could not play {file_path}: {e}")
 
     def load_chat_history(self):
-        if os.path.exists(MEMORY_FILE):
-            try:
-                with open(MEMORY_FILE, "r") as f: return json.load(f)
-            except: pass
-        return [{"role": "system", "content": SYSTEM_PROMPT}]
+        fresh = [{"role": "system", "content": SYSTEM_PROMPT}]
+        if not CHAT_MEMORY_ENABLED or not os.path.exists(MEMORY_FILE):
+            return fresh
+        try:
+            with open(MEMORY_FILE, "r") as f: history = json.load(f)
+        except Exception as e:
+            log.warning(f"[WARN] Could not read {MEMORY_FILE}: {e}. Starting fresh.")
+            return fresh
+        valid = (isinstance(history, list) and history
+                 and all(isinstance(m, dict) and "role" in m and "content" in m for m in history)
+                 and history[0]["role"] == "system")
+        if not valid:
+            log.warning(f"[WARN] {MEMORY_FILE} is malformed. Starting fresh.")
+            return fresh
+        return history
 
     def save_chat_history(self):
-        full = self.permanent_memory + self.session_memory
-        conv = full[1:]
+        if not CHAT_MEMORY_ENABLED: return
+        # The system entry is rebuilt from the current prompt rather than
+        # trusting position 0; only the conversation itself is carried over.
+        conv = [m for m in (self.permanent_memory + self.session_memory) if m.get("role") != "system"]
         if len(conv) > 10: conv = conv[-10:]
-        with open(MEMORY_FILE, "w") as f: 
-            json.dump([full[0]] + conv, f, indent=4)
+        data = [{"role": "system", "content": SYSTEM_PROMPT}] + conv
+        tmp_path = MEMORY_FILE + ".tmp"
+        # Called from the main loop after each turn and from safe_exit on the
+        # tkinter thread; the lock keeps the two from sharing the temp file.
+        with self.memory_lock:
+            try:
+                # Write a private temp file, then atomically swap it in, so a
+                # crash or power loss mid-write never leaves a truncated memory
+                fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as f:
+                    os.fchmod(f.fileno(), 0o600)
+                    json.dump(data, f, indent=4)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, MEMORY_FILE)
+            except Exception as e:
+                log.warning(f"[WARN] Could not save chat history: {e}")
 
 if __name__ == "__main__":
-    print("--- SYSTEM STARTING ---", flush=True)
+    log.info("--- SYSTEM STARTING ---")
+    restrict_private_files()
     root = tk.Tk()
     app = BotGUI(root)
     root.mainloop()

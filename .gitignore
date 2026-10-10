@@ -42,6 +42,7 @@ llama-swap
 
 # Keep chat history local (Privacy)
 memory.json
+memory.json.tmp
 chat_memory.json
 
 # Keep personal API keys or settings local
@@ -63,7 +64,7 @@ Thumbs.db
 ehthumbs.db
 
 # Runtime log
-agent.log
+agent.log*
 
 # whisper.cpp (cloned and built by setup.sh)
 whisper.cpp/
