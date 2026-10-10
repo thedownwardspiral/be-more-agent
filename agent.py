@@ -287,7 +287,8 @@ def log_transcript(prefix, text):
     if LOG_TRANSCRIPTS:
         log.info(f"{prefix} '{text}'")
     else:
-        log.debug(f"{prefix} <redacted, {len(text)} chars>")
+        # Still at INFO, so the log shows the turn happened, just not its words
+        log.info(f"{prefix} <redacted, {len(text)} chars>")
 
 def _err_summary(e):
     """An exception for the log: the full message only when log_transcripts is
@@ -575,9 +576,14 @@ class BotGUI:
         # Per-run scratch space for input.wav and camera photos; removed in safe_exit.
         # A flock on .lock inside it, held for the life of the process, marks it
         # as live so another instance's sweep leaves it alone.
-        self._sweep_stale_tmp_dirs()
-        self.tmp_dir = tempfile.mkdtemp(prefix="be-more-agent-")
+        self.exiting = False
         self.tmp_lock_fd = None
+        # Serializes tmp_lock_fd between _lock_tmp_dir (main loop) and safe_exit
+        self.tmp_lock_guard = threading.Lock()
+        self._sweep_stale_tmp_dirs()
+        # Lock immediately after mkdtemp: until .lock exists, another
+        # instance's sweep would take this fresh dir for a dead run's
+        self.tmp_dir = tempfile.mkdtemp(prefix="be-more-agent-")
         self._lock_tmp_dir()
         # Shown in the IDLE status until a turn succeeds (set by warm_up_logic)
         self.startup_error = None
@@ -598,12 +604,17 @@ class BotGUI:
         self.last_ptt_time = 0 
         self.ptt_event = threading.Event()       
         self.recording_active = threading.Event() 
+        # Set only while detect_wake_word_or_ptt waits for a trigger; Enter
+        # starts PTT only then, never while a turn is still finishing
+        self.awaiting_input = threading.Event()
+        # Makes handle_ptt_toggle's check-and-set atomic against the main
+        # loop clearing a press that landed on a wake word
+        self.ptt_lock = threading.Lock()
         self.interrupted = threading.Event() 
         
         self.tts_queue = queue.Queue()
         self.tts_thread = None
         self.tts_active = threading.Event()
-        self.exiting = False
         self.turn_cam_path = None
         # True while the text box ends in an unfinished "BOT: ..." line. Only
         # the main-loop thread appends conversation text, so it owns this flag.
@@ -678,18 +689,22 @@ class BotGUI:
 
     def _lock_tmp_dir(self):
         """(Re)create tmp_dir/.lock and hold an exclusive flock on it."""
-        fd = None
-        try:
-            fd = os.open(os.path.join(self.tmp_dir, ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as e:
-            log.warning(f"[INIT] Could not lock temp dir: {e}")
-            if fd is not None:
-                os.close(fd)
-            return
-        if self.tmp_lock_fd is not None:
-            os.close(self.tmp_lock_fd)
-        self.tmp_lock_fd = fd
+        with self.tmp_lock_guard:
+            # safe_exit has closed (or is closing) the lock fd; don't open another
+            if self.exiting:
+                return
+            fd = None
+            try:
+                fd = os.open(os.path.join(self.tmp_dir, ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as e:
+                log.warning(f"[INIT] Could not lock temp dir: {e}")
+                if fd is not None:
+                    os.close(fd)
+                return
+            if self.tmp_lock_fd is not None:
+                os.close(self.tmp_lock_fd)
+            self.tmp_lock_fd = fd
 
     def _ensure_tmp_dir(self):
         """Recreate tmp_dir if it vanished (systemd-tmpfiles ages out idle /tmp
@@ -709,8 +724,8 @@ class BotGUI:
             if st.st_uid != os.getuid() or not stat.S_ISDIR(st.st_mode):
                 old_dir = self.tmp_dir
                 self.tmp_dir = tempfile.mkdtemp(prefix="be-more-agent-")
+                self._lock_tmp_dir()  # at once, before any sweep can see it unlocked
                 log.warning(f"[TMP] {old_dir} is no longer ours; using {self.tmp_dir}")
-                self._lock_tmp_dir()
         if not os.path.exists(os.path.join(self.tmp_dir, ".lock")):
             self._lock_tmp_dir()
 
@@ -769,13 +784,15 @@ class BotGUI:
         except Exception:
             pass
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
-        # Released only after the dir is gone, so no sweep can race the rmtree
-        if self.tmp_lock_fd is not None:
-            try:
-                os.close(self.tmp_lock_fd)
-            except OSError:
-                pass
-            self.tmp_lock_fd = None
+        # Released only after the dir is gone, so no sweep can race the rmtree.
+        # Under the guard: the main loop may be in _lock_tmp_dir right now.
+        with self.tmp_lock_guard:
+            if self.tmp_lock_fd is not None:
+                try:
+                    os.close(self.tmp_lock_fd)
+                except OSError:
+                    pass
+                self.tmp_lock_fd = None
         try:
             self.master.quit()
         except Exception:
@@ -848,19 +865,39 @@ class BotGUI:
             return 
         self.last_ptt_time = current_time
 
-        if self.recording_active.is_set():
-            log.info("[PTT] Toggle OFF")
-            self.recording_active.clear() 
-        else:
-            if self.current_state == BotStates.IDLE or "Wait" in self.status_var.get():
+        with self.ptt_lock:
+            if self.recording_active.is_set():
+                # Always allowed: ends a PTT recording
+                log.info("[PTT] Toggle OFF")
+                self.recording_active.clear()
+                return
+            # ON only while the main loop is waiting for a trigger. current_state
+            # alone is not enough: a spacebar interrupt shows IDLE while the
+            # worker may still be stuck finishing the turn (a slow API call or
+            # tool), and an ON+OFF pair in that window would record nothing.
+            if self.current_state == BotStates.IDLE and self.awaiting_input.is_set():
                 log.info("[PTT] Toggle ON")
-                self.recording_active.set() 
+                self.recording_active.set()
                 self.ptt_event.set()
+                return
+        log.info("[PTT] Ignored: still finishing the previous turn")
+        # Tk thread: set the status directly, without touching current_state,
+        # and put the old text back unless something newer replaced it
+        previous = self.status_var.get()
+        self.status_var.set("Finishing...")
+        def _restore():
+            if self.status_var.get() == "Finishing...":
+                self.status_var.set(previous)
+        try:
+            self.master.after(1500, _restore)
+        except tk.TclError:
+            pass
 
     def handle_speaking_interrupt(self, event=None):
         # current_state is written by the main-loop thread; reading one
         # attribute is atomic in CPython, and a stale value only skips a press.
-        if self.current_state == BotStates.SPEAKING or self.current_state == BotStates.THINKING:
+        # CAPTURING too: the tool loop drops the photo once the camera returns.
+        if self.current_state in (BotStates.SPEAKING, BotStates.THINKING, BotStates.CAPTURING):
             self.interrupted.set()
             self.thinking_sound_active.clear()
             while not self.tts_queue.empty():
@@ -1038,6 +1075,16 @@ class BotGUI:
                 # One bad turn must not stop the bot listening for good
                 try:
                     trigger_source = self.detect_wake_word_or_ptt()
+                    with self.ptt_lock:
+                        # Enter from here on is refused until the next wait
+                        self.awaiting_input.clear()
+                        if trigger_source != "PTT":
+                            # An Enter that landed together with the wake word
+                            # (current_state was still IDLE) must not leave PTT
+                            # armed, or the NEXT turn would start recording
+                            # unasked; this turn records adaptively instead
+                            self.recording_active.clear()
+                            self.ptt_event.clear()
                     if self.interrupted.is_set():
                         self.interrupted.clear()
                         self.set_state(BotStates.IDLE, "Resetting...")
@@ -1069,6 +1116,8 @@ class BotGUI:
                     self.chat_and_respond(user_text)
                 except Exception:
                     log.exception("[MAIN] Turn failed; recovering")
+                    # detect_wake_word_or_ptt may have raised mid-wait
+                    self.awaiting_input.clear()
                     self.thinking_sound_active.clear()
                     self._end_bot_line()
                     self.set_state(BotStates.ERROR, "Something went wrong")
@@ -1110,14 +1159,18 @@ class BotGUI:
         # Keep a failed warm-up visible until a turn succeeds
         status = f"Waiting... ({self.startup_error})" if self.startup_error else "Waiting..."
         self.set_state(BotStates.IDLE, status)
-        # Enter pressed while the last turn was still winding down (e.g. after
-        # a spacebar interrupt): PTT is already toggled on, so record now.
-        # Clearing ptt_event and listening would make the next Enter toggle
-        # it off instead, losing the press.
-        if self.recording_active.is_set():
-            self.ptt_event.clear()
-            return "PTT"
+        # From here Enter may toggle PTT on (handle_ptt_toggle); the caller
+        # clears this once a trigger is returned. Set after IDLE, so the two
+        # are never seen as awaiting-but-busy.
+        self.awaiting_input.set()
+        # Clear first, then check: an Enter between the two is then caught by
+        # the check (or by _listen_loop's ptt_event poll), never cleared away.
         self.ptt_event.clear()
+        # PTT already toggled on (e.g. an Enter between awaiting_input.set()
+        # and here, or one kept across a "Resetting..." pass): record now.
+        # Listening instead would make the next Enter toggle it off.
+        if self.recording_active.is_set():
+            return "PTT"
         
         if self.oww_model: self.oww_model.reset()
 
@@ -1222,6 +1275,19 @@ class BotGUI:
                         self.oww_model.reset()
                         return "WAKE"
 
+    def _wait_for_thinking_sound(self):
+        """Let an ending thinking-sound thread finish before this thread calls
+        sd.stop(): stopping another thread's playback crashes PortAudio. Its
+        clip stops within ~50 ms of thinking_sound_active being cleared."""
+        # Every turn clears this on the way out; make sure, since a set flag
+        # would keep the loop (and the join below) going
+        self.thinking_sound_active.clear()
+        t = self.thinking_sound_thread
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=1.0)
+            if t.is_alive():
+                log.warning("[AUDIO] Thinking sound still playing; recording anyway")
+
     def record_voice_adaptive(self, filename=None):
         log.info("Recording (Adaptive)...")
         time.sleep(0.5)
@@ -1271,6 +1337,7 @@ class BotGUI:
 
         try:
             # Release any prior stream first — hardware contention freezes the Pi 5
+            self._wait_for_thinking_sound()
             sd.stop()
             time.sleep(0.2)
 
@@ -1294,6 +1361,7 @@ class BotGUI:
 
         try:
             # Release any prior stream first — hardware contention freezes the Pi 5
+            self._wait_for_thinking_sound()
             sd.stop()
             time.sleep(0.2)
 
@@ -1476,17 +1544,26 @@ class BotGUI:
         self._start_thinking_sound()
 
         full_response_text = ""
+        # Set when the tool-free last round below still produced no text
+        gave_up = False
 
         try:
             client = get_llm_client()
-            for _ in range(MAX_TOOL_ROUNDS):
+            # Up to MAX_TOOL_ROUNDS rounds may run tools; one more round then
+            # forbids them, so a turn never ends on a tool call with no reply
+            for round_num in range(MAX_TOOL_ROUNDS + 1):
+                final_round = round_num == MAX_TOOL_ROUNDS
                 sentence_buffer = ""
                 final_message = None
                 round_started = False
 
+                # The final round keeps tools= (the API rejects tool_use and
+                # tool_result blocks in messages when no tools are defined)
+                # but tool_choice "none" makes Claude answer in text
+                round_kwargs = {"tool_choice": {"type": "none"}} if final_round else {}
                 with client.messages.stream(
                     model=TEXT_MODEL, messages=messages, system=SYSTEM_PROMPT,
-                    tools=turn_tools, max_tokens=MAX_RESPONSE_TOKENS, **LLM_KWARGS
+                    tools=turn_tools, max_tokens=MAX_RESPONSE_TOKENS, **round_kwargs, **LLM_KWARGS
                 ) as stream:
                     for content in stream.text_stream:
                         if self.interrupted.is_set(): break
@@ -1530,6 +1607,10 @@ class BotGUI:
                 if clean_sentence and re.search(r'[a-zA-Z0-9]', clean_sentence):
                     self.tts_queue.put(clean_sentence)
 
+                if final_round:
+                    if not round_started:
+                        gave_up = True
+                    break
                 if final_message.stop_reason != "tool_use":
                     break
 
@@ -1538,7 +1619,7 @@ class BotGUI:
                 messages.append({"role": "assistant", "content": final_message.content})
                 tool_results = []
                 for block in final_message.content:
-                    # Spacebar during a slow tool (search_web): run no more
+                    # Spacebar during a slow tool (search_web, the camera): run no more
                     if self.interrupted.is_set():
                         break
                     if block.type != "tool_use":
@@ -1583,6 +1664,18 @@ class BotGUI:
             self.thinking_sound_active.clear()
             # Claude answered, so whatever failed at warm-up has recovered
             self.startup_error = None
+
+            if gave_up and not self.interrupted.is_set():
+                log.warning(f"[TOOL] No reply after {MAX_TOOL_ROUNDS} tool rounds; giving up")
+                fallback = "I couldn't finish that one."
+                self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=self.turn_cam_path)
+                if not self._bot_line_open:
+                    self.append_to_text("BOT: ", newline=False)
+                    self._bot_line_open = True
+                elif full_response_text and not full_response_text[-1].isspace():
+                    fallback = " " + fallback
+                self.append_to_text(fallback, newline=False)
+                self.tts_queue.put(fallback.strip())
 
             if not self.interrupted.is_set():
                 self.session_memory.append({"role": "user", "content": text})
@@ -1722,9 +1815,9 @@ class BotGUI:
                 time.sleep(0.1)
 
     def _play_clip_interruptible(self, file_path):
-        # Like play_sound, but cuts the clip as soon as thinking ends or TTS
-        # speech starts. All sd.play/sd.stop calls stay on this thread —
-        # stopping another thread's playback crashes PortAudio.
+        # Like play_sound, but cuts the clip (checked every 50 ms) as soon as
+        # thinking ends or TTS speech starts. All sd.play/sd.stop calls stay on
+        # this thread — stopping another thread's playback crashes PortAudio.
         if not file_path or not os.path.exists(file_path): return
         try:
             with wave.open(file_path, 'rb') as wf:
@@ -1747,9 +1840,12 @@ class BotGUI:
             sd.play(audio, playback_rate)
             remaining = len(audio) / playback_rate
             while remaining > 0:
-                # Let the clip finish naturally; only cut it if speech is
-                # actually queued or playing, so voices never overlap
-                if self.tts_active.is_set() or not self.tts_queue.empty():
+                # Cut the clip once speech is queued or playing, so voices
+                # never overlap, and once thinking has ended (reply text
+                # arrived, a spacebar interrupt, the end of the turn), so no
+                # clip outlives the turn into the next recording
+                if (self.tts_active.is_set() or not self.tts_queue.empty()
+                        or not self.thinking_sound_active.is_set()):
                     sd.stop()
                     return
                 time.sleep(0.05)

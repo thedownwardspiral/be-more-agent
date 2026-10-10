@@ -221,7 +221,9 @@ This fork now uses the Anthropic API's native tool use:
   errors) naturally.
 - **`chat_and_respond()`** streams until `stop_reason == "tool_use"`, runs
   the requested tools, appends the assistant content and `tool_result`
-  blocks, and loops (bounded by `MAX_TOOL_ROUNDS`). The separate
+  blocks, and loops. After `MAX_TOOL_ROUNDS` rounds of tool use, a final
+  call is made with `tool_choice` `"none"` so Claude must answer in text,
+  with a spoken fallback if it still produces nothing. The separate
   "summarize this result" second API call is gone — the follow-up response
   has full conversation context.
 - **`extract_json_from_text()`** and the `'{"' in content` stream sniffing

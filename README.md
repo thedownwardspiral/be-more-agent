@@ -172,7 +172,7 @@ Every key is optional; anything you leave out uses its default. Values are check
 | `whisper_threads` | Number of CPU threads for whisper transcription (default: `3`) |
 | `audio_energy_threshold` | RMS energy below which audio is skipped without transcription (default: `0.002`) |
 | `chat_memory` | Persist the conversation to `memory.json` so it survives restarts (default: `true`). `false` never reads or writes the file; history then lasts only for the current run |
-| `log_transcripts` | Write what you said (`Heard: ...`) and what the bot said (`[PIPER SPEAKING] ...`, web search queries) to `agent.log` (default: `true`). `false` records only their length, at a level that is not logged by default |
+| `log_transcripts` | Write what you said (`Heard: ...`) and what the bot said (`[PIPER SPEAKING] ...`, web search queries) to `agent.log` (default: `true`). `false` still logs those lines, but as `<redacted, N chars>` |
 | `camera_rotation` | Rotate camera image (0, 90, 180, 270) |
 | `system_prompt_extras` | Extra personality instructions appended to the system prompt |
 | `input_device` | Microphone to use — a device index, a name substring (e.g. `"USB"`), or `null` for the system default |
@@ -201,7 +201,7 @@ The parameters are not interchangeable: Claude 5.x models reject a non-default `
 
 * The conversation can end up in two places, each with its own switch:
   * `memory.json` holds the recent conversation (the last 10 messages) so it survives restarts. Controlled by `chat_memory`; with `"chat_memory": false` it is never read or written.
-  * `agent.log` records each turn's transcript (`Heard: ...`, `[PIPER SPEAKING] ...`, web search queries) alongside the runtime log. It is rotated at 1 MB with 3 backups (`agent.log.1`–`.3`). Controlled by `log_transcripts`; with `"log_transcripts": false` those lines record only the text's length. Turning `chat_memory` off does **not** stop these log lines; set both to `false` to keep no transcript on disk.
+  * `agent.log` records each turn's transcript (`Heard: ...`, `[PIPER SPEAKING] ...`, web search queries) alongside the runtime log. It is rotated at 1 MB with 3 backups (`agent.log.1`–`.3`). Controlled by `log_transcripts`; with `"log_transcripts": false` those lines are still written but logged as `<redacted, N chars>`, so you can see activity without content. Turning `chat_memory` off does **not** stop these log lines; set both to `false` to keep no transcript on disk.
 * `memory.json`, `agent.log` and its backups, plus `.env`, are kept at mode 600 (owner only) by the agent at startup and by `setup.sh`.
 * Voice recordings and camera photos are written to a private temporary directory and deleted as soon as they have been used (and the directory is removed at exit; one left behind by a crash or power loss is removed on the next start).
 * Say "forget everything" or "reset memory" (a short lead-in like "okay" or the wake word is fine) to wipe the stored conversation. This clears the bot's memory and `memory.json` (deleting the file if `chat_memory` is off), but does **not** purge transcripts already written to `agent.log`; delete `agent.log*` yourself for that. The whole utterance must be the command, so a sentence that merely contains the phrase does nothing.
