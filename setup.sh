@@ -5,6 +5,10 @@ set -euo pipefail
 WHISPER_CPP_REPO="https://github.com/ggerganov/whisper.cpp.git"
 WHISPER_CPP_COMMIT="30c5194c9691e4e9a98b3dea9f19727397d3f46e"
 
+# Fallback wake-word model. openWakeWord moved its models out of the repo into release assets.
+WAKEWORD_URL="https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/hey_jarvis_v0.1.onnx"
+WAKEWORD_SHA256="94a13cfe60075b132f6a472e7e462e8123ee70861bc3fb58434a73712ee0d2cb"
+
 # Define colors for output
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -109,7 +113,17 @@ fi
 echo -e "${YELLOW}[6/8] Checking Wake Word Model...${NC}"
 if [ ! -f "wakeword.onnx" ]; then
     echo -e "${YELLOW}Downloading default 'Hey Jarvis' wake word...${NC}"
-    curl -fL -o wakeword.onnx https://github.com/dscripka/openWakeWord/raw/main/openwakeword/resources/models/hey_jarvis_v0.1.onnx
+    if ! curl -fL -o wakeword.onnx.tmp "$WAKEWORD_URL"; then
+        rm -f wakeword.onnx.tmp
+        echo -e "${RED}❌ Failed to download wake word model from $WAKEWORD_URL${NC}"
+        exit 1
+    fi
+    if ! echo "$WAKEWORD_SHA256  wakeword.onnx.tmp" | sha256sum -c --quiet; then
+        rm -f wakeword.onnx.tmp
+        echo -e "${RED}❌ Wake word model checksum mismatch; refusing to install it.${NC}"
+        exit 1
+    fi
+    mv wakeword.onnx.tmp wakeword.onnx
 fi
 
 # 7. Launch script
