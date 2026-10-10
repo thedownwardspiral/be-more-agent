@@ -7,6 +7,8 @@ __pycache__/
 env/
 venv/
 .env
+.env.*
+!example.env
 .bmo
 .venv
 
@@ -36,6 +38,7 @@ llama-swap
 # Claude Code per-project memory and session state (local working notes,
 # contains local paths and session IDs — not project source)
 .claude/projects/
+.claude/settings.local.json
 
 # Keep chat history local (Privacy)
 memory.json
