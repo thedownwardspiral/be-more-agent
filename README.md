@@ -89,7 +89,7 @@ sudo apt install git -y
 
 ### 2. Clone & Setup
 ```bash
-git clone https://github.com/brenpoly/be-more-agent.git
+git clone https://github.com/thedownwardspiral/be-more-agent.git
 cd be-more-agent
 chmod +x setup.sh
 ./setup.sh
@@ -166,6 +166,7 @@ You can modify the hardware behavior and personality in `config.json`:
 | `system_prompt_extras` | Extra personality instructions appended to the system prompt |
 | `input_device` | Microphone to use — a device index, a name substring (e.g. `"USB"`), or `null` for the system default |
 | `input_sample_rate` | Preferred mic sample rate; the agent verifies it and falls back through 48000/44100/32000/16000 |
+| `max_history_messages` | Most recent chat messages resent to Claude each turn (default: `20`) |
 
 ---
 
@@ -186,6 +187,9 @@ This software is a generic framework. You can give it a new personality by repla
 * **Shutdown Errors:** When you exit the script (Ctrl+C), you might see `Expression 'alsa_snd_pcm_mmap_begin' failed`. **This is normal.** It just means the audio stream was cut off mid-sample. It does not affect the functionality.
 * **Audio Glitches:** If the voice sounds fast or slow, the script attempts to auto-detect sample rates. Ensure your `config.json` points to a valid `.onnx` voice model in the `piper/` folder (with its sibling `.onnx.json` next to it). To switch voices, run `uv run python -m piper.download_voices --data-dir piper <voice-name>`.
 * **Choppy/Fragmented Speech:** If the TTS output sounds broken into tiny fragments, the `TTS_MIN_SENTENCE_LENGTH` constant in `agent.py` (default: 80 characters) controls how much text is buffered before being sent to Piper. Increase it for longer, smoother utterances.
+
+## 🙏 Acknowledgments
+This project is based on [be-more-agent](https://github.com/brenpoly/be-more-agent) by brenpoly, released under the MIT License. It has since diverged substantially; see [FORK_CHANGES.md](FORK_CHANGES.md) for the list of changes.
 
 ## 📄 License
 This project is licensed under the MIT License - see the LICENSE file for details.
