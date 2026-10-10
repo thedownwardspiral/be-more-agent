@@ -81,7 +81,9 @@ DEFAULT_CONFIG = {
     "camera_rotation": 0,
     "system_prompt_extras": "",
     "input_device": None,
-    "input_sample_rate": None
+    "input_sample_rate": None,
+    # Most recent chat messages resent to Claude each turn (user + assistant).
+    "max_history_messages": 20
 }
 
 # LLM SETTINGS
@@ -105,6 +107,7 @@ CURRENT_CONFIG = load_config()
 TEXT_MODEL = os.environ.get("ANTHROPIC_MODEL", CURRENT_CONFIG["text_model"])
 WAKE_WORD_THRESHOLD = CURRENT_CONFIG["wake_word_threshold"]
 WAKE_WORD_CONSECUTIVE = max(1, int(CURRENT_CONFIG["wake_word_consecutive"]))
+MAX_HISTORY_MESSAGES = max(2, int(CURRENT_CONFIG["max_history_messages"]))
 
 # whisper.cpp prefixes every segment with "[hh:mm:ss.mmm --> hh:mm:ss.mmm]".
 # Match only that prefix so bracketed non-speech markers survive intact.
@@ -268,6 +271,7 @@ class BotGUI:
         self.permanent_memory = self.load_chat_history()
         self.session_memory = []
         self.thinking_sound_active = threading.Event()
+        self.thinking_sound_thread = None
         
         self.last_ptt_time = 0 
         self.ptt_event = threading.Event()       
@@ -623,9 +627,11 @@ class BotGUI:
         except Exception as e:
             print(f"[AUDIO] Wake stream failed: {e}. Retrying with fallback settings...", flush=True)
             try:
+                # Only the stream buffering changes; keep reading a full 80ms
+                # frame and resampling exactly as computed above.
                 stream_args["blocksize"] = 1024
                 stream_args["latency"] = "high"
-                return self._listen_loop(stream_args, 1024, CHUNK_SIZE, True)
+                return self._listen_loop(stream_args, input_chunk_size, CHUNK_SIZE, use_resampling)
             except Exception as e2:
                 print(f"[CRITICAL] Wake Word Stream Error: {e2}", flush=True)
                 self.ptt_event.wait()
@@ -841,11 +847,9 @@ class BotGUI:
                 ["./whisper.cpp/build/bin/whisper-cli", "-m", whisper_model, "-l", "en", "-t", whisper_threads, "-f", filename],
                 capture_output=True, text=True
             )
-            transcription_lines = result.stdout.strip().split('\n')
-            if transcription_lines and transcription_lines[-1].strip():
-                last_line = transcription_lines[-1].strip()
-                transcription = WHISPER_TIMESTAMP_RE.sub("", last_line).strip()
-            else: transcription = ""
+            # whisper-cli prints one timestamped line per segment; join them all
+            segments = [WHISPER_TIMESTAMP_RE.sub("", line).strip() for line in result.stdout.split('\n')]
+            transcription = " ".join(seg for seg in segments if seg)
             print(f"Heard: '{transcription}'", flush=True)
             if not self._is_speech(transcription):
                 return ""
@@ -875,9 +879,8 @@ class BotGUI:
     def _history_messages(self):
         """Chat history as Anthropic messages (skips legacy system entries)."""
         history = []
-        for msg in (self.permanent_memory + self.session_memory):
-            if msg["role"] == "system":
-                continue
+        recent = [m for m in (self.permanent_memory + self.session_memory) if m["role"] != "system"]
+        for msg in recent[-MAX_HISTORY_MESSAGES:]:
             if not history and msg["role"] != "user":
                 continue  # API conversations must start with a user message
             history.append(msg)
@@ -898,6 +901,7 @@ class BotGUI:
             self.save_chat_history()
             self.tts_queue.put("Okay. Memory wiped.")
             self.wait_for_tts()
+            self.interrupted.clear()
             self.set_state(BotStates.IDLE, "Memory Wiped")
             return
 
@@ -906,8 +910,7 @@ class BotGUI:
 
         messages = self._history_messages() + [{"role": "user", "content": text}]
 
-        self.thinking_sound_active.set()
-        threading.Thread(target=self._run_thinking_sound_loop, daemon=True).start()
+        self._start_thinking_sound()
 
         full_response_text = ""
 
@@ -967,8 +970,7 @@ class BotGUI:
                 messages.append({"role": "user", "content": tool_results})
 
                 self.set_state(BotStates.THINKING, "Reading...", cam_path=self.turn_cam_path)
-                self.thinking_sound_active.set()
-                threading.Thread(target=self._run_thinking_sound_loop, daemon=True).start()
+                self._start_thinking_sound()
 
             self.thinking_sound_active.clear()
 
@@ -977,8 +979,13 @@ class BotGUI:
                 if full_response_text.strip():
                     self.append_to_text("")
                     self.session_memory.append({"role": "assistant", "content": full_response_text})
+                if len(self.session_memory) > MAX_HISTORY_MESSAGES:
+                    del self.session_memory[:-MAX_HISTORY_MESSAGES]
 
             self.wait_for_tts()
+            # Playback is finished; a spacebar interrupt of this response must
+            # not discard the next wake word
+            self.interrupted.clear()
             self.set_state(BotStates.IDLE, "Ready")
 
         except Exception as e:
@@ -987,6 +994,7 @@ class BotGUI:
             # Don't reopen the mic while queued speech is still playing,
             # or the bot records and answers its own voice
             self.wait_for_tts()
+            self.interrupted.clear()
             self.set_state(BotStates.ERROR, "Brain Freeze!")
 
     def wait_for_tts(self):
@@ -1074,6 +1082,13 @@ class BotGUI:
                 except: pass
                 try: stream.close()
                 except: pass
+
+    def _start_thinking_sound(self):
+        # One loop thread at most: two threads calling sd.play() crash PortAudio
+        self.thinking_sound_active.set()
+        if self.thinking_sound_thread is None or not self.thinking_sound_thread.is_alive():
+            self.thinking_sound_thread = threading.Thread(target=self._run_thinking_sound_loop, daemon=True)
+            self.thinking_sound_thread.start()
 
     def _run_thinking_sound_loop(self):
         time.sleep(0.5)

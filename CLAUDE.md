@@ -36,7 +36,7 @@ Everything lives in `agent.py` — a single ~920-line script with one main class
 
 3. **Tool Execution** (`execute_tool`) — Runs tools requested by Claude via native tool use. Three tools: `get_time`, `search_web` (DuckDuckGo), `capture_image` (Pi camera via `rpicam-still`). `capture_image` returns the photo as a base64 image block inside the `tool_result`, so Claude sees it with the full conversation history.
 
-4. **Core Logic** (`safe_main_execution`) — Main loop: detect wake word or PTT → record audio → transcribe → chat → speak. Two recording modes: adaptive silence detection and push-to-talk (Enter key). The wake-word listener (`_listen_loop`) uses cheap nearest-neighbor resampling, skips inference on near-silence, and retries once with fallback stream settings (blocksize 1024, high latency) before degrading to PTT.
+4. **Core Logic** (`safe_main_execution`) — Main loop: detect wake word or PTT → record audio → transcribe → chat → speak. Two recording modes: adaptive silence detection and push-to-talk (Enter key). The wake-word listener (`_listen_loop`) uses cheap nearest-neighbor resampling, skips inference on near-silence, and retries once with fallback stream settings (blocksize 1024, high latency; still reading and resampling full 80 ms frames) before degrading to PTT.
 
 5. **Chat & Respond** (`chat_and_respond`) — Streams the response via the Anthropic Messages API with `tools=TOOLS`. When the stream ends with `stop_reason == "tool_use"`, it executes the requested tools, appends the assistant content and `tool_result` blocks to the messages, and loops (bounded by `MAX_TOOL_ROUNDS`) so Claude can use the results in context. Streamed text is buffered and flushed to TTS only when a sentence-ending punctuation mark is reached **and** the buffer meets a minimum length (`TTS_MIN_SENTENCE_LENGTH`, default 80 chars), preventing choppy playback of short fragments.
 
@@ -66,7 +66,7 @@ The agent uses the **Anthropic API** (Claude) for all LLM tasks. The `anthropic`
 
 `.env` contains sensitive configuration (API keys). Copy `example.env` to `.env` and fill in your `ANTHROPIC_API_KEY`. The `.env` file is gitignored.
 
-`config.json` controls: Claude model name, voice model path, whisper model path, whisper thread count, audio energy threshold, chat memory toggle, camera rotation, a system prompt extension, microphone selection (`input_device` — index, name substring, or `null` for default), and a preferred input sample rate (`input_sample_rate`). The script merges user config over `DEFAULT_CONFIG` defaults.
+`config.json` controls: Claude model name, voice model path, whisper model path, whisper thread count, audio energy threshold, chat memory toggle, camera rotation, a system prompt extension, microphone selection (`input_device` — index, name substring, or `null` for default), a preferred input sample rate (`input_sample_rate`), and how many recent chat messages are resent to Claude each turn (`max_history_messages`, default 20). The script merges user config over `DEFAULT_CONFIG` defaults.
 
 ## Display
 

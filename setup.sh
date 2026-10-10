@@ -1,4 +1,9 @@
 #!/bin/bash
+set -euo pipefail
+
+# whisper.cpp commit to build. Bump this to upgrade whisper.cpp.
+WHISPER_CPP_REPO="https://github.com/ggerganov/whisper.cpp.git"
+WHISPER_CPP_COMMIT="30c5194c9691e4e9a98b3dea9f19727397d3f46e"
 
 # Define colors for output
 GREEN='\033[0;32m'
@@ -23,8 +28,11 @@ fi
 echo -e "${YELLOW}[1/8] Installing System Tools (apt)...${NC}"
 sudo apt update
 BLAS_PKG="libopenblas-dev"
-if apt-cache policy libatlas-base-dev 2>/dev/null | grep -q "Candidate:" && \
-   ! apt-cache policy libatlas-base-dev 2>/dev/null | grep -q "Candidate: (none)"; then
+# Capture the policy first: piping straight into `grep -q` can SIGPIPE
+# apt-cache, which pipefail would report as a failed check.
+ATLAS_POLICY="$(apt-cache policy libatlas-base-dev 2>/dev/null || true)"
+if grep -q "Candidate:" <<<"$ATLAS_POLICY" && \
+   ! grep -q "Candidate: (none)" <<<"$ATLAS_POLICY"; then
     BLAS_PKG="libatlas-base-dev"
 fi
 sudo apt install -y python3-tk libasound2-dev libportaudio2 "$BLAS_PKG" cmake build-essential espeak-ng git
@@ -60,22 +68,35 @@ uv run python -m piper.download_voices --data-dir piper en_US-bmo-medium
 
 # 5. Build whisper.cpp and download model
 echo -e "${YELLOW}[5/8] Building whisper.cpp...${NC}"
-if [ ! -d "whisper.cpp" ]; then
-    git clone https://github.com/ggerganov/whisper.cpp.git
+# Check for CMakeLists.txt rather than the directory: an empty or partial
+# whisper.cpp/ (e.g. left behind by an old submodule pointer or an interrupted
+# clone) must not skip the clone.
+if [ ! -f "whisper.cpp/CMakeLists.txt" ]; then
+    if [ -d "whisper.cpp" ]; then
+        echo -e "${YELLOW}whisper.cpp/ is empty or incomplete; re-cloning...${NC}"
+        rm -rf whisper.cpp
+    fi
+    git clone "$WHISPER_CPP_REPO" whisper.cpp
+    git -C whisper.cpp -c advice.detachedHead=false checkout "$WHISPER_CPP_COMMIT"
 fi
-cd whisper.cpp
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release -j$(nproc)
-if [ ! -f "models/ggml-base.en.bin" ]; then
-    bash models/download-ggml-model.sh base.en
+(
+    cd whisper.cpp
+    cmake -B build -DCMAKE_BUILD_TYPE=Release
+    cmake --build build --config Release -j"$(nproc)"
+    if [ ! -f "models/ggml-base.en.bin" ]; then
+        bash models/download-ggml-model.sh base.en
+    fi
+)
+if [ ! -x "whisper.cpp/build/bin/whisper-cli" ]; then
+    echo -e "${RED}❌ whisper.cpp build failed: whisper.cpp/build/bin/whisper-cli not found.${NC}"
+    exit 1
 fi
-cd ..
 
 # 6. OpenWakeWord Model
 echo -e "${YELLOW}[6/8] Checking Wake Word Model...${NC}"
 if [ ! -f "wakeword.onnx" ]; then
     echo -e "${YELLOW}Downloading default 'Hey Jarvis' wake word...${NC}"
-    curl -L -o wakeword.onnx https://github.com/dscripka/openWakeWord/raw/main/openwakeword/resources/models/hey_jarvis_v0.1.onnx
+    curl -fL -o wakeword.onnx https://github.com/dscripka/openWakeWord/raw/main/openwakeword/resources/models/hey_jarvis_v0.1.onnx
 fi
 
 # 7. Launch script

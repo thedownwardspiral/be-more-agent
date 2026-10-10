@@ -166,6 +166,7 @@ You can modify the hardware behavior and personality in `config.json`:
 | `system_prompt_extras` | Extra personality instructions appended to the system prompt |
 | `input_device` | Microphone to use — a device index, a name substring (e.g. `"USB"`), or `null` for the system default |
 | `input_sample_rate` | Preferred mic sample rate; the agent verifies it and falls back through 48000/44100/32000/16000 |
+| `max_history_messages` | Most recent chat messages resent to Claude each turn (default: `20`) |
 
 ---
 

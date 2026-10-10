@@ -61,3 +61,6 @@ ehthumbs.db
 
 # Runtime log
 agent.log
+
+# whisper.cpp (cloned and built by setup.sh)
+whisper.cpp/
