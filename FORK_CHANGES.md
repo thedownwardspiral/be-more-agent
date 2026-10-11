@@ -493,3 +493,23 @@ fallback.
   between two words becomes one space. Output is independent of delta splits.
 - **Give-up fallback**: when the tool-round cap is hit with no reply, the
   spoken "I couldn't finish that one." is saved with the reply too.
+
+## Pipelined TTS
+
+- **Two stages**: a synth thread turns `tts_queue` text into PCM chunks on a
+  bounded `audio_queue` (16) while a playback thread plays the previous
+  sentence, so the next sentence is ready when this one ends. The ~1 s gap
+  after a short opening sentence is gone (measured: 0 ms between sentences,
+  first audio ~0.5 s after the text is queued).
+- **One stream per reply**: the playback thread opens one `RawOutputStream`
+  on the first chunk and closes it when nothing more is queued or being
+  synthesized, instead of opening and closing one per sentence.
+- **Draining**: `stop()` does not drain on the Pi's PulseAudio-backed ALSA
+  device, so the end of a reply is flushed with a buffer's worth of silence
+  before `stop()`; this replaces the 0.5 s sleep after each sentence.
+- **Interrupts**: the spacebar handler only sets `interrupted` and empties
+  `tts_queue`; the playback thread aborts its own stream within one 2048-frame
+  write and empties `audio_queue`.
+- **`wait_for_tts()`** now returns only once queued speech has been heard and
+  the stream closed (both queues joined, then `playback_idle`); the main
+  loop's per-turn error handler calls it too.
