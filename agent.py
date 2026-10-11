@@ -390,21 +390,34 @@ RECORD_CHUNK_DURATION = 0.05  # 50 ms input blocks
 # Parakeet's single-call decode cost grows super-linearly (Pi 5: 30 s of audio
 # 4.8 s, 90 s 20.5 s / +830 MB, 180 s 58.5 s / +1.7 GB) and can't be interrupted.
 MAX_PTT_RECORD_TIME = 60.0
-# Longer audio is decoded by Parakeet in chunks of at most this many seconds,
-# split at the quietest STT_SPLIT_WINDOW within STT_SPLIT_SEARCH seconds of
-# each target (the target sits STT_SPLIT_SEARCH before the cap, so no chunk
-# ever exceeds it)
+# Longer audio is decoded by Parakeet in chunks of at most this many seconds.
+# Each cut is the centre of the quietest STT_SPLIT_WINDOW whose start lies
+# within STT_SPLIT_SEARCH seconds of a target STT_SPLIT_SEARCH before the cap;
+# the window must also end by the cap, and that clamp (not the target) is what
+# keeps every chunk within STT_CHUNK_SECONDS.
 STT_CHUNK_SECONDS = 25.0
 STT_SPLIT_SEARCH = 3.0
 STT_SPLIT_WINDOW = 0.2
 STT_SPLIT_FRAME = 0.02
+# No chunk after the last cut may be shorter than this: Parakeet invents a
+# filler ("Okay.", "Mm-hmm.") for a lone sub-second near-silent chunk.
+STT_MIN_LAST_CHUNK = 2.0
+# Chunks shorter than this are not decoded at all (safety net for the above)
+STT_MIN_DECODE_CHUNK = 1.0
 
 def stt_split_points(audio, rate=STT_SAMPLE_RATE):
     """Sample indices at which to cut `audio` into chunks of at most
-    STT_CHUNK_SECONDS. Each cut is the centre of the lowest-energy
-    STT_SPLIT_WINDOW (RMS over STT_SPLIT_FRAME frames) within STT_SPLIT_SEARCH
-    seconds of its target, so it lands in a pause rather than mid-word.
-    Returns [] when the audio fits in one chunk."""
+    STT_CHUNK_SECONDS, the last at least STT_MIN_LAST_CHUNK. Each cut is the
+    centre of the STT_SPLIT_WINDOW with the lowest mean energy (mean square of
+    the samples, over STT_SPLIT_FRAME frames) in its search range: window
+    starts from STT_SPLIT_SEARCH before the target up to the earliest of
+    STT_SPLIT_SEARCH after it, a window end at the cap, and a cut
+    STT_MIN_LAST_CHUNK before the end of the audio. That is a pause when the
+    range has one; continuous speech can still be cut between syllables.
+    Should that range ever be empty, the rest is split into two near-equal
+    halves at the quietest window within STT_SPLIT_SEARCH of the midpoint
+    (each half stays under the cap). Returns [] when the audio fits in one
+    chunk."""
     n = len(audio)
     max_len = int(STT_CHUNK_SECONDS * rate)
     if n <= max_len:
@@ -418,21 +431,34 @@ def stt_split_points(audio, rate=STT_SAMPLE_RATE):
     win_energy = (csum[win:] - csum[:-win]) / win
     search = int(STT_SPLIT_SEARCH / STT_SPLIT_FRAME)
     cap = int(STT_CHUNK_SECONDS / STT_SPLIT_FRAME)
+    min_last = int(round(STT_MIN_LAST_CHUNK / STT_SPLIT_FRAME))
+
+    def quietest(lo, hi, target):
+        """Start frame of the quietest window in [lo, hi]; among (near-)equal
+        ones (within 5% in energy) the one nearest `target`."""
+        cand = win_energy[lo:hi + 1]
+        quiet = np.flatnonzero(cand <= cand.min() * 1.05 + 1e-12) + lo
+        return int(quiet[np.argmin(np.abs(quiet - target))])
+
     points = []
     prev = 0  # in frames
     while n - prev * frame > max_len:
         target = prev + cap - search
-        # Window must end by prev + cap, so the chunk stays within the cap
         lo = max(prev + 1, target - search)
-        hi = min(len(win_energy) - 1, prev + cap - win, target + search)
+        # Window must end by prev + cap (chunk within the cap), and the cut
+        # must leave at least STT_MIN_LAST_CHUNK of audio after it
+        hi = min(len(win_energy) - 1, prev + cap - win, target + search,
+                 n_frames - min_last - win // 2)
         if hi < lo:
-            cut = prev + cap - win // 2
-        else:
-            cand = win_energy[lo:hi + 1]
-            # Quietest window; among (near-)equal ones the one nearest the target
-            quiet = np.flatnonzero(cand <= cand.min() * 1.05 + 1e-12) + lo
-            start = int(quiet[np.argmin(np.abs(quiet - target))])
-            cut = start + win // 2
+            # No valid window (not expected while > STT_CHUNK_SECONDS remain):
+            # split the rest into two halves instead (each well under the cap)
+            mid = (prev + n_frames) // 2 - win // 2
+            lo = max(prev + 1, mid - search)
+            hi = min(len(win_energy) - 1, mid + search)
+            cut = quietest(lo, hi, mid) + win // 2
+            points.append(cut * frame)
+            break
+        cut = quietest(lo, hi, target) + win // 2
         points.append(cut * frame)
         prev = cut
     return points
@@ -2034,9 +2060,13 @@ class BotGUI:
                 return self._decode_parakeet_chunk(audio)
             bounds = [0] + points + [len(audio)]
             texts = []
-            t_total = time.monotonic()
             for i in range(len(bounds) - 1):
                 chunk = audio[bounds[i]:bounds[i + 1]]
+                if len(chunk) < STT_MIN_DECODE_CHUNK * STT_SAMPLE_RATE:
+                    # Parakeet invents a filler word for a short quiet chunk
+                    log.debug(f"[STT] parakeet chunk {i + 1}/{len(bounds) - 1}: skipped "
+                              f"({len(chunk) / STT_SAMPLE_RATE:.2f}s of audio)")
+                    continue
                 t0 = time.monotonic()
                 text = self._decode_parakeet_chunk(chunk)
                 log.info(f"[STT] parakeet chunk {i + 1}/{len(bounds) - 1}: "
@@ -2044,8 +2074,6 @@ class BotGUI:
                          f"from {bounds[i] / STT_SAMPLE_RATE:.2f}s)")
                 if text:
                     texts.append(text)
-            log.info(f"[STT] parakeet {len(bounds) - 1} chunks, {time.monotonic() - t_total:.1f}s total "
-                     f"({len(audio) / STT_SAMPLE_RATE:.1f}s of audio)")
             return " ".join(texts)
         except Exception as e:
             log.error(f"Transcription Error: Parakeet failed: {e}")

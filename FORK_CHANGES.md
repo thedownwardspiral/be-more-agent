@@ -575,9 +575,18 @@ Claude; the turn ends through the usual path (no memory save, TTS drained,
   top of the ~1 GB model; spacebar cannot interrupt a decode).
 - **Chunked decoding**: Parakeet decodes audio longer than 25 s
   (`STT_CHUNK_SECONDS`) in chunks of at most 25 s, cut at the quietest
-  200 ms window within ±3 s of each target, so cuts land in pauses rather
-  than mid-word. Each chunk uses a fresh stream; the texts are joined with a
-  space; each chunk and the total are logged. A 55.7 s test recording (five
+  200 ms window within ±3 s of each target (the window must end by the
+  25 s cap, which is what bounds the chunk). That is a pause when one
+  exists in the range; continuous speech can still be cut between
+  syllables. The last chunk is never shorter than 2 s
+  (`STT_MIN_LAST_CHUNK`): the search range also stops 2 s before the end,
+  because a lone sub-second quiet tail chunk made Parakeet invent a
+  trailing "Okay.", "Mm-hmm." or "Uh" (8 of 10 test clips of 25.1-25.3 s;
+  with the fix 10 of 10 match the single-call decode). Chunks under 1 s
+  are skipped, not decoded. Chunking bounds time and memory; a decode
+  still cannot be interrupted. Each chunk uses a fresh stream; the texts
+  are joined with a space; each chunk is logged and `transcribe_audio`
+  logs the total. A 55.7 s test recording (five
   questions repeated, 1.5 s gaps) split at 22.10 s and 43.84 s, both in
   gaps, and decoded in 7.6 s with +150 MB peak RSS, versus 10.0 s and
   +383 MB in one call, with the same words. Audio up to 25 s is decoded in
