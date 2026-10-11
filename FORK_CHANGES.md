@@ -429,7 +429,7 @@ fallback.
 | --------------- | --------------------------------------- | ------------------------------------------------------ |
 | Speech-to-text  | `whisper-cli` subprocess, base.en       | NVIDIA Parakeet-TDT 0.6B v2 int8, in-process (sherpa-onnx) |
 | STT time (Pi 5) | 2.6–3.0 s per question, any length      | 0.22–0.56 s for 1.4–4.1 s questions                    |
-| End of speech   | RMS noise floor + fixed 1.5 s tail      | Silero VAD, `vad_min_silence` 0.6 s (0.7 s measured)   |
+| End of speech   | RMS noise floor + fixed 1.5 s tail      | Silero VAD, `vad_min_silence` 0.9 s + `vad_resume_window` 0.6 s (1.6 s measured) |
 | Audio handoff   | `input.wav` in the temp dir             | 16 kHz float32 array (WAV only for whisper)            |
 
 - **Dependencies**: `sherpa-onnx==1.13.8` and `sherpa-onnx-core==1.13.8`
@@ -445,7 +445,8 @@ fallback.
   fallback engine.
 - **New config keys**: `stt_engine` (`"parakeet"` | `"whisper"`, default
   parakeet), `stt_threads` (1–4, default 2; 3 is no faster on a Pi 5),
-  `vad_min_silence` (0.2–3.0 s, default 0.6), `vad_threshold` (0.1–0.9,
+  `vad_min_silence` (0.2–3.0 s, default 0.9), `vad_resume_window` (0.0–2.0 s,
+  default 0.6), `vad_threshold` (0.1–0.9,
   default 0.5). `silence_threshold` now only applies to the RMS fallback.
 - **Loading**: Parakeet loads once in `__init__` (~3 s, ~1 GB RSS) and
   decodes on the main-loop thread. If sherpa-onnx or a model file is
@@ -467,6 +468,8 @@ fallback.
   both engines, but `WHISPER_HALLUCINATIONS` ("thank you", "okay", "bye",
   ...) now applies only to whisper, so those replies reach Claude when
   Parakeet hears them.
+- **Review fixes**: `vad_resume_window` bridges mid-sentence pauses; fillers
+  ("um", "hmm") dropped for both engines; 0.5 s grace on the 5 s no-speech cutoff.
 - **Logging**: each transcription logs `[STT] <engine> <seconds>`, and
   the VAD logs the segment bounds and where the recording stopped.
 - **Attribution**: Parakeet-TDT 0.6B v2 is CC-BY-4.0 (NVIDIA); credited in

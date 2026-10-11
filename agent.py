@@ -145,10 +145,15 @@ DEFAULT_CONFIG = {
     "whisper_model": "./whisper.cpp/models/ggml-base.en.bin",
     "whisper_threads": 3,
     "audio_energy_threshold": 0.002,
-    # Silero VAD ends a wake-word recording this many seconds after speech
-    # stops (raise it if you get cut off mid-sentence), counting audio as
-    # speech above vad_threshold (0.1-0.9; raise it in a noisy room).
-    "vad_min_silence": 0.6,
+    # Silero VAD closes a speech segment after vad_min_silence seconds of
+    # quiet, then waits vad_resume_window more for the speaker to go on (0 =
+    # don't wait); speech in that window is merged into the same utterance.
+    # So a recording ends ~1.5 s after the last word by default; raise
+    # vad_min_silence if you get cut off mid-sentence, lower either key for
+    # snappier turns. Audio counts as speech above vad_threshold (0.1-0.9;
+    # raise it in a noisy room).
+    "vad_min_silence": 0.9,
+    "vad_resume_window": 0.6,
     "vad_threshold": 0.5,
     # Used only if models/silero_vad.onnx is missing (RMS silence detection)
     "silence_threshold": 0.006,
@@ -238,6 +243,7 @@ CONFIG_RANGES = {
     "stt_engine": (lambda v: v in ("parakeet", "whisper"), '"parakeet" or "whisper"'),
     "stt_threads": (lambda v: 1 <= v <= 4, "between 1 and 4"),
     "vad_min_silence": (lambda v: 0.2 <= v <= 3.0, "between 0.2 and 3.0"),
+    "vad_resume_window": (lambda v: 0.0 <= v <= 2.0, "between 0.0 and 2.0"),
     "vad_threshold": (lambda v: 0.1 <= v <= 0.9, "between 0.1 and 0.9"),
     "whisper_threads": (lambda v: 1 <= v <= 8, "between 1 and 8"),
     "camera_rotation": (lambda v: v in (0, 90, 180, 270), "one of 0, 90, 180, 270"),
@@ -359,6 +365,7 @@ PARAKEET_FILES = {
 SILERO_VAD_MODEL = BASE_DIR / "models" / "silero_vad.onnx"
 VAD_THRESHOLD = CURRENT_CONFIG["vad_threshold"]
 VAD_MIN_SILENCE = CURRENT_CONFIG["vad_min_silence"]
+VAD_RESUME_WINDOW = CURRENT_CONFIG["vad_resume_window"]
 # Kept around the VAD's speech segment, in 16 kHz samples: Silero puts the
 # start ~50 ms into the first word, and the end needs no more than a breath
 VAD_PRE_ROLL = int(0.3 * STT_SAMPLE_RATE)
@@ -366,6 +373,10 @@ VAD_POST_ROLL = int(0.2 * STT_SAMPLE_RATE)
 # Wake-word recordings: hard cap, and how long to wait for speech to start
 MAX_RECORD_TIME = 30.0
 LEADING_SILENCE_TIME = 5.0
+# The VAD reports speech only after min_speech_duration (0.25 s) plus ~0.35 s of
+# model lag, so speech starting just before LEADING_SILENCE_TIME is still being
+# confirmed at the cutoff; this grace keeps it from being dropped.
+LEADING_SILENCE_GRACE = 0.5
 RECORD_CHUNK_DURATION = 0.05  # 50 ms input blocks
 
 def resample_to_stt_rate(audio, rate, padtype="constant"):
@@ -428,13 +439,20 @@ def normalize_words(text):
     text = re.sub(r"[-–—]", " ", text.lower())
     return " ".join(re.sub(r"[^\w\s]", "", text).split())
 
-# Well-known whisper hallucinations on silent/near-silent input. Only ever compared
-# against the *entire* transcript, so a real sentence containing these is unaffected.
-# Stored normalized ("amara.org" -> "amaraorg") to match normalize_words() output.
-WHISPER_HALLUCINATIONS = {normalize_words(p) for p in (
+# Both sets are only ever compared against the *entire* transcript, so a real
+# sentence containing these is unaffected. Stored normalized ("amara.org" ->
+# "amaraorg") to match normalize_words() output.
+# Pure fillers and non-word sounds: a false wake on a cough or a hesitant "um"
+# with nothing after it, from either engine. Never worth sending to Claude.
+FILLER_UTTERANCES = {normalize_words(p) for p in (
+    "um", "uh", "hmm", "mm", "oh", "so", "ah", "er", "erm",
+)}
+# Conversational phrases whisper invents on silent/near-silent input. Parakeet
+# doesn't, so a real "thank you" or "okay" to it must reach Claude.
+WHISPER_ONLY_HALLUCINATIONS = {normalize_words(p) for p in (
     "you", "thank you", "thanks for watching", "thank you for watching",
-    "bye", "bye bye", "okay", "oh", "so", "um", "uh", "hmm", "mm",
-    "please subscribe", "subtitles by the amara.org community",
+    "bye", "bye bye", "okay", "please subscribe",
+    "subtitles by the amara.org community",
 )}
 
 def is_valid_memory(history):
@@ -835,7 +853,8 @@ class BotGUI:
                         max_speech_duration=MAX_RECORD_TIME + 1),
                     sample_rate=STT_SAMPLE_RATE, num_threads=1)
                 vad = sherpa_onnx.VoiceActivityDetector(config, buffer_size_in_seconds=MAX_RECORD_TIME + 10)
-                log.info(f"[INIT] Silero VAD loaded: recordings end {VAD_MIN_SILENCE}s after speech")
+                log.info(f"[INIT] Silero VAD loaded: recordings end {VAD_MIN_SILENCE}s "
+                         f"+ {VAD_RESUME_WINDOW}s resume window after speech")
                 return vad
             except Exception as e:
                 reason = f"loading failed: {e}"
@@ -1468,12 +1487,29 @@ class BotGUI:
         return self._finish_recording(audio)
 
     def _record_until_vad_end(self, samplerate):
-        """Endpoint with Silero VAD: stop once vad_min_silence of quiet follows
-        speech, or no speech has started after LEADING_SILENCE_TIME. Returns 16
-        kHz float32 audio around the speech segment, or None if there was none."""
+        """Endpoint with Silero VAD. Returns 16 kHz float32 audio spanning every
+        speech segment of the utterance (padded), or None if there was no speech.
+
+        States, advanced once per 50 ms block:
+          waiting   - no speech yet. Give up after LEADING_SILENCE_TIME, plus
+                      LEADING_SILENCE_GRACE while the VAD is still confirming
+                      speech that began just before the cutoff (returns None).
+          speaking  - the VAD is inside a segment. Silero closes it after
+                      vad_min_silence of quiet.
+          resuming  - a segment just closed. Keep listening vad_resume_window
+                      longer: if speech starts again ("...weather like <pause>
+                      in Boston"), go back to speaking and merge the segments;
+                      otherwise stop. With no resumption the recording ends
+                      vad_min_silence + vad_resume_window (0.9 + 0.6 = 1.5 s by
+                      default) after the last word. A window of 0 stops at once.
+        MAX_RECORD_TIME caps the whole recording in any state; the VAD is then
+        flushed so speech still in progress counts as a segment.
+        """
         chunk_size = int(samplerate * RECORD_CHUNK_DURATION)
         max_samples = int(MAX_RECORD_TIME * STT_SAMPLE_RATE)
         leading_samples = int(LEADING_SILENCE_TIME * STT_SAMPLE_RATE)
+        grace_samples = int(LEADING_SILENCE_GRACE * STT_SAMPLE_RATE)
+        resume_samples = int(VAD_RESUME_WINDOW * STT_SAMPLE_RATE)
         blocks = queue.Queue()
         raw = []
 
@@ -1483,8 +1519,10 @@ class BotGUI:
 
         vad = self.vad
         vad.reset()
-        fed = 0           # 16 kHz samples given to the VAD so far
-        heard = False
+        fed = 0               # 16 kHz samples given to the VAD so far
+        heard = False         # the VAD has reported speech at least once
+        segments = []         # finished segments as (start, end), 16 kHz samples
+        resume_until = None   # set while resuming: stop when fed reaches it
         ended = False
         # Bounds the loop even if the stream stops delivering blocks
         deadline = time.monotonic() + MAX_RECORD_TIME + 5
@@ -1502,25 +1540,50 @@ class BotGUI:
                 samples = resample_to_stt_rate(block, samplerate, padtype="line")
                 vad.accept_waveform(samples)
                 fed += len(samples)
-                if not vad.empty():
-                    ended = True  # a complete segment: speech, then the silence tail
-                    break
-                if not heard and vad.is_speech_detected():
+
+                closed = False  # a segment (speech, then the silence tail) finished
+                while not vad.empty():
+                    seg = vad.front
+                    segments.append((seg.start, seg.start + len(seg.samples)))
+                    vad.pop()
+                    closed = True
+                in_speech = vad.is_speech_detected()
+                if in_speech and not heard:
                     heard = True
                     log.info(f"[VAD] Speech started ({fed / STT_SAMPLE_RATE:.2f}s)")
-                if fed >= max_samples or (not heard and fed >= leading_samples):
+
+                if closed and not in_speech:
+                    # speaking -> resuming (or stop, with no resume window)
+                    if resume_samples == 0:
+                        ended = True
+                        break
+                    resume_until = fed + resume_samples
+                elif in_speech and resume_until is not None:
+                    # resuming -> speaking: the speaker went on after a pause
+                    log.info(f"[VAD] Speech resumed ({fed / STT_SAMPLE_RATE:.2f}s)")
+                    resume_until = None
+                if resume_until is not None and fed >= resume_until:
+                    ended = True  # resume window passed in silence
+                    break
+                if fed >= max_samples:
+                    break
+                # waiting: no speech by the cutoff, and none being confirmed now
+                if not heard and not in_speech and fed >= leading_samples + grace_samples:
                     break
 
         if not ended:
             vad.flush()  # finalize speech that ran into the time limit
-        if vad.empty():
+            while not vad.empty():
+                seg = vad.front
+                segments.append((seg.start, seg.start + len(seg.samples)))
+                vad.pop()
+        if not segments:
             log.info(f"[VAD] No speech in {fed / STT_SAMPLE_RATE:.1f}s")
             return None
-        segment = vad.front
-        start = segment.start
-        end = segment.start + len(segment.samples)
-        log.info(f"[VAD] Speech {start / STT_SAMPLE_RATE:.2f}-{end / STT_SAMPLE_RATE:.2f}s, "
-                 f"stopped at {fed / STT_SAMPLE_RATE:.2f}s")
+        start = segments[0][0]
+        end = segments[-1][1]
+        log.info(f"[VAD] Speech {start / STT_SAMPLE_RATE:.2f}-{end / STT_SAMPLE_RATE:.2f}s "
+                 f"({len(segments)} segment(s)), stopped at {fed / STT_SAMPLE_RATE:.2f}s")
         audio = self._buffer_to_stt_rate(raw, samplerate)
         if audio is None:
             return None
@@ -1653,7 +1716,8 @@ class BotGUI:
             return True  # transcribe on error to be safe
 
     def _is_speech(self, transcription, engine):
-        """False for whisper's non-speech annotations and silence hallucinations.
+        """False for non-speech annotations, bare fillers, and whisper's silence
+        hallucinations.
 
         A false wake word fire on room noise used to reach the LLM as "(wind
         blowing)" and get answered out loud. Whisper is already telling us there
@@ -1668,10 +1732,14 @@ class BotGUI:
             log.info("[AUDIO] Non-speech audio — ignoring.")
             return False
 
-        # The list is whisper's failure modes. Parakeet doesn't invent text on
+        # The text itself was already logged (or redacted) as "Heard:"
+        words = normalize_words(residue)
+        if words in FILLER_UTTERANCES:
+            log.info("[AUDIO] Filler only — ignoring.")
+            return False
+        # Whisper's silence hallucinations. Parakeet doesn't invent text on
         # silence, so a real "thank you" or "okay" to it must get through.
-        if engine == "whisper" and normalize_words(residue) in WHISPER_HALLUCINATIONS:
-            # The text itself was already logged (or redacted) as "Heard:"
+        if engine == "whisper" and words in WHISPER_ONLY_HALLUCINATIONS:
             log.info("[AUDIO] Silence hallucination — ignoring.")
             return False
 

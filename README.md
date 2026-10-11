@@ -13,7 +13,7 @@ This project turns a Raspberry Pi into a fully functional, conversational AI age
 
 * **Powered by Claude**: Uses the **Anthropic API** for intelligent conversation and vision understanding. Supports any Claude model (Sonnet, Opus, Haiku).
 * **On-Device Speech Pipeline**: NVIDIA **Parakeet** (TDT 0.6B v2, via [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)) for speech-to-text and **Piper TTS** for text-to-speech run locally on the Pi, both loaded once and kept in memory. Parakeet transcribes a typical question in 0.2–0.6 s on a Pi 5 (whisper.cpp base.en: 2.6–3.0 s) and is more accurate. **whisper.cpp** remains as a selectable fallback (`"stt_engine": "whisper"`).
-* **Quick Turn-Taking**: **Silero VAD** decides when you have finished speaking, ending the recording about 0.6 s after your last word (configurable), instead of waiting out a fixed 1.5 s of silence.
+* **Quick Turn-Taking**: **Silero VAD** decides when you have finished speaking, ending the recording about 1.5 s after your last word: it waits out a 0.9 s pause, then 0.6 s more in case you carry on, so a mid-sentence pause doesn't cut you off. Both are configurable.
 * **Open Source Wake Word**: Wakes up to your custom model using **OpenWakeWord** (Offline & Free). No access keys required.
 * **Hardware-Aware Audio**: Automatically detects your microphone's sample rate and resamples audio on the fly to prevent ALSA errors. Includes an audio energy gate that skips transcription on silent/blank recordings to save CPU.
 * **Smart Web Search**: Uses DuckDuckGo to find real-time news and information when Claude doesn't know the answer.
@@ -152,7 +152,8 @@ You can modify the hardware behavior and personality in `config.json`:
     "voice_model": "piper/en_US-bmo-medium.onnx",
     "stt_engine": "parakeet",
     "stt_threads": 2,
-    "vad_min_silence": 0.6,
+    "vad_min_silence": 0.9,
+    "vad_resume_window": 0.6,
     "vad_threshold": 0.5,
     "whisper_model": "./whisper.cpp/models/ggml-base.en.bin",
     "whisper_threads": 3,
@@ -176,7 +177,8 @@ Every key is optional; anything you leave out uses its default. Values are check
 | `voice_model` | Path to Piper TTS voice `.onnx` file (with sibling `.onnx.json`, as written by `python -m piper.download_voices`) |
 | `stt_engine` | Speech-to-text engine: `"parakeet"` (default; in-process, ~1 GB RAM) or `"whisper"` (whisper.cpp). If the Parakeet model is missing the agent uses whisper and says so in the status line |
 | `stt_threads` | CPU threads for Parakeet, `1`–`4` (default: `2`; more is no faster on a Pi 5) |
-| `vad_min_silence` | Seconds of silence after speech that end a wake-word recording, `0.2`–`3.0` (default: `0.6`). Raise it if you get cut off when you pause mid-sentence |
+| `vad_min_silence` | Seconds of silence after speech that close a speech segment, `0.2`–`3.0` (default: `0.9`). Raise it if you get cut off when you pause mid-sentence |
+| `vad_resume_window` | Seconds to keep listening after a segment closes, `0.0`–`2.0` (default: `0.6`; `0` stops at once). Speech that starts again in this window joins the same question. A recording ends `vad_min_silence` + `vad_resume_window` (1.5 s by default) after your last word; lower either for snappier turns |
 | `vad_threshold` | Silero VAD speech probability, `0.1`–`0.9` (default: `0.5`). Raise it if background noise keeps recordings open |
 | `whisper_model` | Path to whisper.cpp model file, used when `stt_engine` is `"whisper"` (default: `ggml-base.en.bin`) |
 | `whisper_threads` | Number of CPU threads for whisper transcription (default: `3`) |
@@ -224,6 +226,7 @@ This software is a generic framework. You can give it a new personality by repla
 * **`[CONFIG]` warnings at startup:** Config problems are reported in the console and `agent.log` when the agent starts. A bad value or unknown key is skipped (its default is used); if `config.json` is not valid JSON, the **whole file is ignored** with a loud error banner and every setting is at its default, so fix the syntax and restart.
 * **Startup shows "Can't reach Claude: check API key / network":** The warm-up request failed. Check `ANTHROPIC_API_KEY` in `.env`, the network connection, and that the `temperature`/`effort` keys suit `text_model`. The exact API error is in `agent.log`.
 * **Status shows "Parakeet unavailable: using whisper" (or `[STT] ERROR` / `[VAD] Silero VAD unavailable` in `agent.log`):** The speech models in `models/` are missing or `sherpa-onnx` is not installed. Run `uv sync`, then re-run `./setup.sh` (step 5 downloads `models/parakeet-tdt-0.6b-v2-int8/` and `models/silero_vad.onnx`, verifying their checksums), and restart the agent. Until then it transcribes with whisper.cpp and ends recordings on a 1.5 s silence. Each transcription logs its time as `[STT] parakeet 0.43s` so you can compare engines.
+* **Cut off mid-sentence, or the agent waits too long after you finish:** Wake-word recordings end `vad_min_silence` + `vad_resume_window` seconds (default 0.9 + 0.6) after your last word; `agent.log` shows `[VAD] Speech ... stopped at ...` and `[VAD] Speech resumed` when a pause was bridged. Raise `vad_min_silence` if long pauses still cut you off; lower `vad_resume_window` (or `vad_min_silence`) if turns feel slow.
 * **"No search library found":** If web search fails, ensure you are in the `.venv` virtual environment and `ddgs` is installed (`uv sync`).
 * **Shutdown Errors:** When you exit the script (Ctrl+C), you might see `Expression 'alsa_snd_pcm_mmap_begin' failed`. **This is normal.** It just means the audio stream was cut off mid-sample. It does not affect the functionality.
 * **Audio Glitches:** If the voice sounds fast or slow, the script attempts to auto-detect sample rates. Ensure your `config.json` points to a valid `.onnx` voice model in the `piper/` folder (with its sibling `.onnx.json` next to it). To switch voices, run `uv run python -m piper.download_voices --data-dir piper <voice-name>`.
