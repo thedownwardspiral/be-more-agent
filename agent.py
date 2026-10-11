@@ -162,6 +162,16 @@ DEFAULT_CONFIG = {
 # LLM SETTINGS
 MAX_TOOL_ROUNDS = 5
 TTS_MIN_SENTENCE_LENGTH = 80
+# Lower bar for the first chunk of a turn: Piper synthesizes a short sentence
+# in ~0.2 s, so waiting for 80 chars would dominate time-to-first-audio. Once
+# the bot is talking, later chunks use TTS_MIN_SENTENCE_LENGTH to avoid choppy
+# fragments.
+TTS_FIRST_SENTENCE_MIN_LENGTH = 20
+# A sentence end anywhere in the buffer: punctuation (plus closing quotes or
+# brackets) followed by whitespace or the end of the buffer. Stream deltas
+# rarely end exactly on punctuation ("! Let"), so the buffer is split at the
+# last match rather than only checked at its end. "3.14" doesn't match.
+TTS_SENTENCE_END_RE = re.compile(r'[.!?]+["\')\]]*(?=\s|$)')
 
 # Keys that also accept null, with the types accepted otherwise. Every other key
 # must match the type of its DEFAULT_CONFIG value.
@@ -1545,6 +1555,9 @@ class BotGUI:
         self._start_thinking_sound()
 
         full_response_text = ""
+        # Per turn, not per tool round: once anything has gone to TTS this
+        # turn, later chunks use the longer TTS_MIN_SENTENCE_LENGTH
+        first_chunk_sent = False
         # Set when the tool-free last round below still produced no text
         gave_up = False
 
@@ -1591,11 +1604,16 @@ class BotGUI:
                         self.append_to_text(content, newline=False)
 
                         sentence_buffer += content
-                        if re.search(r'[.!?][\s\n]*$', sentence_buffer) and len(sentence_buffer.strip()) >= TTS_MIN_SENTENCE_LENGTH:
-                            clean_sentence = sentence_buffer.strip()
+                        min_len = TTS_MIN_SENTENCE_LENGTH if first_chunk_sent else TTS_FIRST_SENTENCE_MIN_LENGTH
+                        split_at = None
+                        for m in TTS_SENTENCE_END_RE.finditer(sentence_buffer):
+                            split_at = m.end()
+                        if split_at is not None and len(sentence_buffer[:split_at].strip()) >= min_len:
+                            clean_sentence = sentence_buffer[:split_at].strip()
+                            sentence_buffer = sentence_buffer[split_at:]
                             if re.search(r'[a-zA-Z0-9]', clean_sentence):
                                 self.tts_queue.put(clean_sentence)
-                            sentence_buffer = ""
+                                first_chunk_sent = True
 
                     if not self.interrupted.is_set():
                         final_message = stream.get_final_message()
@@ -1607,6 +1625,7 @@ class BotGUI:
                 clean_sentence = sentence_buffer.strip()
                 if clean_sentence and re.search(r'[a-zA-Z0-9]', clean_sentence):
                     self.tts_queue.put(clean_sentence)
+                    first_chunk_sent = True
 
                 if final_round:
                     if not round_started:
