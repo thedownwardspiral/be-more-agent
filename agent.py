@@ -162,6 +162,41 @@ DEFAULT_CONFIG = {
 # LLM SETTINGS
 MAX_TOOL_ROUNDS = 5
 TTS_MIN_SENTENCE_LENGTH = 80
+# Lower bar for the first chunk of a turn, and of the text after each tool
+# round: Piper synthesizes a short sentence in ~0.2 s, so waiting for 80 chars
+# would dominate time-to-first-audio. Once the bot is talking, later chunks use
+# TTS_MIN_SENTENCE_LENGTH to avoid choppy fragments.
+TTS_FIRST_SENTENCE_MIN_LENGTH = 20
+# A sentence end anywhere in the buffer: punctuation (plus closing quotes or
+# brackets) followed by whitespace. Stream deltas rarely end exactly on
+# punctuation ("! Let"), so the buffer is split at the last match rather than
+# only checked at its end. The end of the buffer is not a sentence end: "3."
+# may be followed by "14" in the next delta. Whatever is left when a round
+# ends is flushed anyway.
+TTS_SENTENCE_END_RE = re.compile(r'[.!?…]+["\'”’)\]]*(?=\s)')
+# A word that a period follows without ending the sentence: common
+# abbreviations, single letters and dotted initials ("J.", "U.S.", "p.m."),
+# and 1-2 digit list numbers ("1. Go hiking").
+TTS_ABBREVIATION_RE = re.compile(
+    r'(?i)^(?:(?:[a-z]\.)*[a-z]|\d{1,2}|mr|mrs|ms|dr|st|jr|sr|vs|etc|prof|mt|no)$'
+)
+
+
+def last_sentence_end(buffer):
+    """Index just past the last sentence end in buffer, or None.
+
+    A single period after an abbreviation, initial or list number
+    ("St. Louis", "3 p.m. on", "1. Go") is not a sentence end.
+    """
+    end = None
+    for m in TTS_SENTENCE_END_RE.finditer(buffer):
+        if m.group().rstrip('"\'”’)]') == ".":
+            token = re.search(r'\S*$', buffer[:m.start()]).group().lstrip('"\'“‘([')
+            if TTS_ABBREVIATION_RE.match(token):
+                continue
+        end = m.end()
+    return end
+
 
 # Keys that also accept null, with the types accepted otherwise. Every other key
 # must match the type of its DEFAULT_CONFIG value.
@@ -1545,6 +1580,10 @@ class BotGUI:
         self._start_thinking_sound()
 
         full_response_text = ""
+        # Once anything has gone to TTS, later chunks use the longer
+        # TTS_MIN_SENTENCE_LENGTH. Reset after each tool round, so the first
+        # sentence after a (silent) tool call also starts quickly.
+        first_chunk_sent = False
         # Set when the tool-free last round below still produced no text
         gave_up = False
 
@@ -1591,11 +1630,14 @@ class BotGUI:
                         self.append_to_text(content, newline=False)
 
                         sentence_buffer += content
-                        if re.search(r'[.!?][\s\n]*$', sentence_buffer) and len(sentence_buffer.strip()) >= TTS_MIN_SENTENCE_LENGTH:
-                            clean_sentence = sentence_buffer.strip()
+                        min_len = TTS_MIN_SENTENCE_LENGTH if first_chunk_sent else TTS_FIRST_SENTENCE_MIN_LENGTH
+                        split_at = last_sentence_end(sentence_buffer)
+                        if split_at is not None and len(sentence_buffer[:split_at].strip()) >= min_len:
+                            clean_sentence = sentence_buffer[:split_at].strip()
+                            sentence_buffer = sentence_buffer[split_at:]
                             if re.search(r'[a-zA-Z0-9]', clean_sentence):
                                 self.tts_queue.put(clean_sentence)
-                            sentence_buffer = ""
+                                first_chunk_sent = True
 
                     if not self.interrupted.is_set():
                         final_message = stream.get_final_message()
@@ -1607,6 +1649,7 @@ class BotGUI:
                 clean_sentence = sentence_buffer.strip()
                 if clean_sentence and re.search(r'[a-zA-Z0-9]', clean_sentence):
                     self.tts_queue.put(clean_sentence)
+                    first_chunk_sent = True
 
                 if final_round:
                     if not round_started:
@@ -1658,6 +1701,7 @@ class BotGUI:
                 if self.interrupted.is_set():
                     break
                 messages.append({"role": "user", "content": tool_results})
+                first_chunk_sent = False
 
                 self.set_state(BotStates.THINKING, "Reading...", cam_path=self.turn_cam_path)
                 self._start_thinking_sound()
@@ -1782,8 +1826,11 @@ class BotGUI:
                         break
                     stream.write(audio_bytes[i:i + byte_step])
 
+            # Let the device drain its buffered audio before stop() so the
+            # end of the reply isn't clipped. When another sentence is
+            # already queued, keep the gap short so the reply flows.
             if stream is not None and not self.interrupted.is_set():
-                time.sleep(0.5)
+                time.sleep(0.05 if not self.tts_queue.empty() else 0.5)
 
         except Exception as e:
             log.error(f"Audio Error: {e}")
