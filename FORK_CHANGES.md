@@ -172,7 +172,7 @@ instead of a prebuilt binary.
   found.
 - **BLAS package**: Falls back to `libopenblas-dev` if `libatlas-base-dev`
   is not available (compatibility with newer Pi OS releases).
-- **Whisper.cpp**: Added a build step (now step 5/9) that clones,
+- **Whisper.cpp**: Added a build step (now step 6/10) that clones,
   compiles, and downloads the `base.en` model. The original did not
   include whisper.cpp setup.
 - **Ollama model pull removed**: The `ollama pull gemma3:1b` and
@@ -417,3 +417,61 @@ The bundled `sounds/*.wav` clips were deleted earlier (07c0230); the
   images now reuses the idle frames.
 - **Linting**: ruff config in `pyproject.toml` (line length 120, py311,
   E4/E7/E9/F, E402 ignored for `agent.py`). Run `uvx ruff check agent.py`.
+
+## Speech-to-Text: Parakeet and Silero VAD
+
+whisper.cpp pads every input to a 30 s window, so each turn spent a fixed
+2.6–3.7 s transcribing, and the RMS silence detector waited 1.5 s after the
+last word before it even started. Both are replaced; whisper.cpp stays as a
+fallback.
+
+| Stage           | Before                                  | After                                                  |
+| --------------- | --------------------------------------- | ------------------------------------------------------ |
+| Speech-to-text  | `whisper-cli` subprocess, base.en       | NVIDIA Parakeet-TDT 0.6B v2 int8, in-process (sherpa-onnx) |
+| STT time (Pi 5) | 2.6–3.0 s per question, any length      | 0.22–0.56 s for 1.4–4.1 s questions                    |
+| End of speech   | RMS noise floor + fixed 1.5 s tail      | Silero VAD, `vad_min_silence` 0.9 s + `vad_resume_window` 0.6 s (1.6 s measured) |
+| Audio handoff   | `input.wav` in the temp dir             | 16 kHz float32 array (WAV only for whisper)            |
+
+- **Dependencies**: `sherpa-onnx==1.13.8` and `sherpa-onnx-core==1.13.8`
+  (Apache-2.0). The core package ships the `libonnxruntime.so` the
+  extension links against; it is listed explicitly because some
+  sherpa-onnx wheels (armv7l) omit it from their metadata and uv locks from
+  those, leaving aarch64 with an unimportable module. It coexists with the
+  `onnxruntime` wheel used by Piper and openWakeWord in one process.
+- **setup.sh step 5/10**: downloads the Parakeet archive (~460 MB) and
+  `silero_vad.onnx`, verifies pinned SHA-256 sums, unpacks through a
+  scratch directory into `models/parakeet-tdt-0.6b-v2-int8/`, and skips
+  files already present. whisper.cpp is now step 6/10, labelled as the
+  fallback engine.
+- **New config keys**: `stt_engine` (`"parakeet"` | `"whisper"`, default
+  parakeet), `stt_threads` (1–4, default 2; 3 is no faster on a Pi 5),
+  `vad_min_silence` (0.2–3.0 s, default 0.9), `vad_resume_window` (0.0–2.0 s,
+  default 0.6), `vad_threshold` (0.1–0.9,
+  default 0.5). `silence_threshold` now only applies to the RMS fallback.
+- **Loading**: Parakeet loads once in `__init__` (~3 s, ~1 GB RSS) and
+  decodes on the main-loop thread. If sherpa-onnx or a model file is
+  missing, or loading fails, the run falls back to whisper with an ERROR
+  naming setup.sh step 5 and "Parakeet unavailable: using whisper" in the
+  idle status. A missing VAD model falls back to the RMS detector with a
+  single warning. `sherpa_onnx` is imported in a `try`, so a stale `.venv`
+  still starts.
+- **VAD recording**: the input callback only queues 50 ms blocks; the main
+  loop resamples each to 16 kHz for the VAD, stops once a segment ends (or
+  at 30 s, or after 5 s with no speech, which now returns "Heard nothing."
+  without running STT), and cuts the utterance from the whole recording
+  around the segment with 0.3 s / 0.2 s of padding.
+- **Shorter pre-record wait**: the 0.5 s sleep before both recorders is
+  now 0.2 s. Nothing plays between the trigger and the recording and the
+  wake-word stream is already closed; the device settle after `sd.stop()`
+  (0.2 s) is unchanged.
+- **Hallucination filter**: non-speech annotations are still dropped for
+  both engines, but `WHISPER_HALLUCINATIONS` ("thank you", "okay", "bye",
+  ...) now applies only to whisper, so those replies reach Claude when
+  Parakeet hears them.
+- **Review fixes**: `vad_resume_window` bridges mid-sentence pauses; fillers
+  ("um", "hmm") dropped for both engines; 0.5 s grace on the 5 s no-speech cutoff.
+- **Logging**: each transcription logs `[STT] <engine> <seconds>`, and
+  the VAD logs the segment bounds and where the recording stopped.
+- **Attribution**: Parakeet-TDT 0.6B v2 is CC-BY-4.0 (NVIDIA); credited in
+  the README's Acknowledgments. The model is downloaded by setup.sh, not
+  committed.

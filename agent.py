@@ -17,7 +17,7 @@ os.environ.setdefault("DISPLAY", ":0")
 from pathlib import Path
 
 # Every relative path in this file (config.json, .env, memory.json, faces/,
-# sounds/, piper/, wakeword.onnx, and the whisper.cpp paths in config.json) is
+# sounds/, piper/, models/, wakeword.onnx, and the whisper.cpp paths in config.json) is
 # relative to the repo root. Anchor the process there so the agent works no
 # matter which directory it was launched from (SSH, systemd, autostart).
 BASE_DIR = Path(__file__).resolve().parent
@@ -71,6 +71,7 @@ from PIL import Image, ImageTk
 import threading
 import time
 import json
+import math
 import subprocess
 import random
 import re
@@ -100,6 +101,15 @@ from openwakeword.model import Model
 import anthropic
 from piper import PiperVoice
 from dotenv import load_dotenv
+# Speech-to-text (Parakeet) and voice activity detection (Silero) run in-process
+# through sherpa-onnx. Guarded so a .venv that predates it (start_agent.sh runs
+# .venv/bin/python directly, without `uv sync`) still starts, on whisper.cpp.
+try:
+    import sherpa_onnx
+    SHERPA_IMPORT_ERROR = None
+except ImportError as e:
+    sherpa_onnx = None
+    SHERPA_IMPORT_ERROR = e
 import base64
 
 # Load environment variables from the repo's .env file
@@ -125,9 +135,27 @@ DEFAULT_CONFIG = {
     # Claude Haiku 5.5, paired with temperature null and effort "low" below.
     "text_model": "claude-haiku-5-5",
     "voice_model": "piper/en_US-bmo-medium.onnx",
+    # Speech-to-text engine: "parakeet" (NVIDIA Parakeet-TDT 0.6B v2, in-process
+    # via sherpa-onnx; models/ is filled by setup.sh step 5) or "whisper" (the
+    # whisper.cpp fallback below). A missing Parakeet model falls back to whisper.
+    "stt_engine": "parakeet",
+    # CPU threads for Parakeet. 2 is fastest on a Pi 5; 3 or 4 are no faster.
+    "stt_threads": 2,
+    # Used only when stt_engine is "whisper" (or Parakeet could not load)
     "whisper_model": "./whisper.cpp/models/ggml-base.en.bin",
     "whisper_threads": 3,
     "audio_energy_threshold": 0.002,
+    # Silero VAD closes a speech segment after vad_min_silence seconds of
+    # quiet, then waits vad_resume_window more for the speaker to go on (0 =
+    # don't wait); speech in that window is merged into the same utterance.
+    # So a recording ends ~1.5 s after the last word by default; raise
+    # vad_min_silence if you get cut off mid-sentence, lower either key for
+    # snappier turns. Audio counts as speech above vad_threshold (0.1-0.9;
+    # raise it in a noisy room).
+    "vad_min_silence": 0.9,
+    "vad_resume_window": 0.6,
+    "vad_threshold": 0.5,
+    # Used only if models/silero_vad.onnx is missing (RMS silence detection)
     "silence_threshold": 0.006,
     # Raise either of these only if you observe genuine false wakes; 0.5/1 is the
     # long-standing openwakeword default. "consecutive" requires N frames in a row
@@ -212,6 +240,11 @@ CONFIG_RANGES = {
     "wake_word_threshold": (lambda v: 0 < v <= 1, "greater than 0 and at most 1"),
     "wake_word_consecutive": (lambda v: v >= 1, "at least 1"),
     "max_history_messages": (lambda v: v >= 2, "at least 2"),
+    "stt_engine": (lambda v: v in ("parakeet", "whisper"), '"parakeet" or "whisper"'),
+    "stt_threads": (lambda v: 1 <= v <= 4, "between 1 and 4"),
+    "vad_min_silence": (lambda v: 0.2 <= v <= 3.0, "between 0.2 and 3.0"),
+    "vad_resume_window": (lambda v: 0.0 <= v <= 2.0, "between 0.0 and 2.0"),
+    "vad_threshold": (lambda v: 0.1 <= v <= 0.9, "between 0.1 and 0.9"),
     "whisper_threads": (lambda v: 1 <= v <= 8, "between 1 and 8"),
     "camera_rotation": (lambda v: v in (0, 90, 180, 270), "one of 0, 90, 180, 270"),
     "audio_energy_threshold": (lambda v: v >= 0, "0 or more"),
@@ -317,6 +350,43 @@ WAKE_WORD_CONSECUTIVE = CURRENT_CONFIG["wake_word_consecutive"]
 MAX_HISTORY_MESSAGES = CURRENT_CONFIG["max_history_messages"]
 CHAT_MEMORY_ENABLED = CURRENT_CONFIG["chat_memory"]
 LOG_TRANSCRIPTS = CURRENT_CONFIG["log_transcripts"]
+STT_ENGINE = CURRENT_CONFIG["stt_engine"]
+STT_THREADS = CURRENT_CONFIG["stt_threads"]
+
+# Both STT engines take 16 kHz mono; recordings are converted to this rate.
+STT_SAMPLE_RATE = 16000
+PARAKEET_MODEL_DIR = BASE_DIR / "models" / "parakeet-tdt-0.6b-v2-int8"
+PARAKEET_FILES = {
+    "encoder": "encoder.int8.onnx",
+    "decoder": "decoder.int8.onnx",
+    "joiner": "joiner.int8.onnx",
+    "tokens": "tokens.txt",
+}
+SILERO_VAD_MODEL = BASE_DIR / "models" / "silero_vad.onnx"
+VAD_THRESHOLD = CURRENT_CONFIG["vad_threshold"]
+VAD_MIN_SILENCE = CURRENT_CONFIG["vad_min_silence"]
+VAD_RESUME_WINDOW = CURRENT_CONFIG["vad_resume_window"]
+# Kept around the VAD's speech segment, in 16 kHz samples: Silero puts the
+# start ~50 ms into the first word, and the end needs no more than a breath
+VAD_PRE_ROLL = int(0.3 * STT_SAMPLE_RATE)
+VAD_POST_ROLL = int(0.2 * STT_SAMPLE_RATE)
+# Wake-word recordings: hard cap, and how long to wait for speech to start
+MAX_RECORD_TIME = 30.0
+LEADING_SILENCE_TIME = 5.0
+# The VAD reports speech only after min_speech_duration (0.25 s) plus ~0.35 s of
+# model lag, so speech starting just before LEADING_SILENCE_TIME is still being
+# confirmed at the cutoff; this grace keeps it from being dropped.
+LEADING_SILENCE_GRACE = 0.5
+RECORD_CHUNK_DURATION = 0.05  # 50 ms input blocks
+
+def resample_to_stt_rate(audio, rate, padtype="constant"):
+    """float32 mono audio at `rate` -> float32 at STT_SAMPLE_RATE (polyphase)."""
+    rate = int(rate)
+    if rate == STT_SAMPLE_RATE:
+        return np.asarray(audio, dtype=np.float32)
+    g = math.gcd(rate, STT_SAMPLE_RATE)
+    return scipy.signal.resample_poly(audio, STT_SAMPLE_RATE // g, rate // g,
+                                      padtype=padtype).astype(np.float32)
 
 def log_transcript(prefix, text):
     """Log a line carrying the user's or the bot's words, honouring log_transcripts."""
@@ -369,13 +439,20 @@ def normalize_words(text):
     text = re.sub(r"[-–—]", " ", text.lower())
     return " ".join(re.sub(r"[^\w\s]", "", text).split())
 
-# Well-known whisper hallucinations on silent/near-silent input. Only ever compared
-# against the *entire* transcript, so a real sentence containing these is unaffected.
-# Stored normalized ("amara.org" -> "amaraorg") to match normalize_words() output.
-WHISPER_HALLUCINATIONS = {normalize_words(p) for p in (
+# Both sets are only ever compared against the *entire* transcript, so a real
+# sentence containing these is unaffected. Stored normalized ("amara.org" ->
+# "amaraorg") to match normalize_words() output.
+# Pure fillers and non-word sounds: a false wake on a cough or a hesitant "um"
+# with nothing after it, from either engine. Never worth sending to Claude.
+FILLER_UTTERANCES = {normalize_words(p) for p in (
+    "um", "uh", "hmm", "mm", "oh", "so", "ah", "er", "erm",
+)}
+# Conversational phrases whisper invents on silent/near-silent input. Parakeet
+# doesn't, so a real "thank you" or "okay" to it must reach Claude.
+WHISPER_ONLY_HALLUCINATIONS = {normalize_words(p) for p in (
     "you", "thank you", "thanks for watching", "thank you for watching",
-    "bye", "bye bye", "okay", "oh", "so", "um", "uh", "hmm", "mm",
-    "please subscribe", "subtitles by the amara.org community",
+    "bye", "bye bye", "okay", "please subscribe",
+    "subtitles by the amara.org community",
 )}
 
 def is_valid_memory(history):
@@ -669,6 +746,19 @@ class BotGUI:
         except Exception as e:
             log.error(f"[CRITICAL] Failed to load Piper voice '{voice_model}': {e}")
 
+        # --- SPEECH-TO-TEXT INITIALIZATION ---
+        # None means whisper.cpp transcribes (configured, or the fallback)
+        self.recognizer = None
+        # Shown in the IDLE status for the whole run when Parakeet was wanted
+        # but could not load, so the slower fallback is not silent
+        self.stt_notice = None
+        if STT_ENGINE == "parakeet":
+            self._load_parakeet()
+        else:
+            log.info("[INIT] Speech-to-text: whisper.cpp (stt_engine is \"whisper\")")
+        # Ends wake-word recordings; None means RMS silence detection
+        self.vad = self._load_vad()
+
         # --- WAKE WORD INITIALIZATION ---
         log.info("[INIT] Loading Wake Word...")
         self.oww_model = None
@@ -722,6 +812,55 @@ class BotGUI:
         threading.Thread(target=self.safe_main_execution, daemon=True).start()
 
     # --- HELPERS ---
+
+    def _load_parakeet(self):
+        """Load Parakeet into self.recognizer, or log why not and leave whisper on."""
+        paths = {k: PARAKEET_MODEL_DIR / f for k, f in PARAKEET_FILES.items()}
+        missing = [p for p in paths.values() if not p.is_file()]
+        if sherpa_onnx is None:
+            reason = f"sherpa-onnx is not importable ({SHERPA_IMPORT_ERROR}); run `uv sync`"
+        elif missing:
+            reason = (f"model file {missing[0].relative_to(BASE_DIR)} is missing; "
+                      "run setup.sh (step 5 downloads it)")
+        else:
+            log.info(f"[INIT] Loading Parakeet speech-to-text ({STT_THREADS} threads, ~1 GB RAM)...")
+            t0 = time.monotonic()
+            try:
+                self.recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
+                    **{k: str(p) for k, p in paths.items()},
+                    model_type="nemo_transducer", num_threads=STT_THREADS)
+                log.info(f"[INIT] Parakeet loaded in {time.monotonic() - t0:.1f}s")
+                return
+            except Exception as e:
+                reason = f"loading failed: {e}"
+        log.error(f"[STT] ERROR: Parakeet unavailable: {reason}. "
+                  "Falling back to whisper.cpp for this run.")
+        self.stt_notice = "Parakeet unavailable: using whisper"
+
+    def _load_vad(self):
+        """Silero VAD for record_voice_adaptive, or None (logged) to use RMS silence."""
+        if sherpa_onnx is None:
+            reason = "sherpa-onnx is not importable; run `uv sync`"
+        elif not SILERO_VAD_MODEL.is_file():
+            reason = f"{SILERO_VAD_MODEL.relative_to(BASE_DIR)} is missing; run setup.sh (step 5 downloads it)"
+        else:
+            try:
+                config = sherpa_onnx.VadModelConfig(
+                    silero_vad=sherpa_onnx.SileroVadModelConfig(
+                        model=str(SILERO_VAD_MODEL), threshold=VAD_THRESHOLD,
+                        min_silence_duration=VAD_MIN_SILENCE, min_speech_duration=0.25,
+                        # Past this Silero force-splits a segment; never before our own cap
+                        max_speech_duration=MAX_RECORD_TIME + 1),
+                    sample_rate=STT_SAMPLE_RATE, num_threads=1)
+                vad = sherpa_onnx.VoiceActivityDetector(config, buffer_size_in_seconds=MAX_RECORD_TIME + 10)
+                log.info(f"[INIT] Silero VAD loaded: recordings end {VAD_MIN_SILENCE}s "
+                         f"+ {VAD_RESUME_WINDOW}s resume window after speech")
+                return vad
+            except Exception as e:
+                reason = f"loading failed: {e}"
+        log.warning(f"[VAD] Silero VAD unavailable: {reason}. "
+                    "Ending recordings on RMS silence (1.5 s tail) instead.")
+        return None
 
     def _lock_tmp_dir(self):
         """(Re)create tmp_dir/.lock and hold an exclusive flock on it."""
@@ -1128,21 +1267,17 @@ class BotGUI:
 
                     self.set_state(BotStates.LISTENING, "I'm listening!")
                 
-                    audio_file = None
+                    # 16 kHz float32 mono samples, or None
                     if trigger_source == "PTT":
-                        audio_file = self.record_voice_ptt()
+                        audio = self.record_voice_ptt()
                     else:
-                        audio_file = self.record_voice_adaptive()
-                
-                    if not audio_file: 
+                        audio = self.record_voice_adaptive()
+
+                    if audio is None:
                         self.set_state(BotStates.IDLE, "Heard nothing.")
                         continue
-                
-                    try:
-                        user_text = self.transcribe_audio(audio_file)
-                    finally:
-                        # The recording is only needed for whisper; don't leave it on disk
-                        self._remove_file(audio_file)
+
+                    user_text = self.transcribe_audio(audio)
                     if not user_text:
                         self.set_state(BotStates.IDLE, "Transcription empty.")
                         continue
@@ -1192,8 +1327,10 @@ class BotGUI:
         log.info("Ready.")
 
     def detect_wake_word_or_ptt(self):
-        # Keep a failed warm-up visible until a turn succeeds
-        status = f"Waiting... ({self.startup_error})" if self.startup_error else "Waiting..."
+        # Keep a failed warm-up visible until a turn succeeds, and an STT
+        # fallback for the whole run
+        notes = [n for n in (self.startup_error, self.stt_notice) if n]
+        status = f"Waiting... ({'; '.join(notes)})" if notes else "Waiting..."
         self.set_state(BotStates.IDLE, status)
         # From here Enter may toggle PTT on (handle_ptt_toggle); the caller
         # clears this once a trigger is returned. Set after IDLE, so the two
@@ -1324,22 +1461,149 @@ class BotGUI:
             if t.is_alive():
                 log.warning("[AUDIO] Thinking sound still playing; recording anyway")
 
-    def record_voice_adaptive(self, filename=None):
+    def record_voice_adaptive(self):
+        """Record until the speaker stops. Returns 16 kHz float32 samples or None."""
         log.info("Recording (Adaptive)...")
-        time.sleep(0.5)
+        # Nothing plays between the trigger and here (no sound on wake), and the
+        # wake-word stream is already closed; the device settle is the 0.2 s
+        # after sd.stop() below. Any longer wait only drops the first words.
+        time.sleep(0.2)
         samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
 
+        try:
+            # Release any prior stream first — hardware contention freezes the Pi 5
+            self._wait_for_thinking_sound()
+            sd.stop()
+            time.sleep(0.2)
+
+            if self.vad is not None:
+                audio = self._record_until_vad_end(samplerate)
+            else:
+                audio = self._record_until_rms_silence(samplerate)
+        except Exception as e:
+            log.error(f"[AUDIO ERROR] Adaptive Recording Failed: {e}")
+            return None
+
+        return self._finish_recording(audio)
+
+    def _record_until_vad_end(self, samplerate):
+        """Endpoint with Silero VAD. Returns 16 kHz float32 audio spanning every
+        speech segment of the utterance (padded), or None if there was no speech.
+
+        States, advanced once per 50 ms block:
+          waiting   - no speech yet. Give up after LEADING_SILENCE_TIME, plus
+                      LEADING_SILENCE_GRACE while the VAD is still confirming
+                      speech that began just before the cutoff (returns None).
+          speaking  - the VAD is inside a segment. Silero closes it after
+                      vad_min_silence of quiet.
+          resuming  - a segment just closed. Keep listening vad_resume_window
+                      longer: if speech starts again ("...weather like <pause>
+                      in Boston"), go back to speaking and merge the segments;
+                      otherwise stop. With no resumption the recording ends
+                      vad_min_silence + vad_resume_window (0.9 + 0.6 = 1.5 s by
+                      default) after the last word. A window of 0 stops at once.
+        MAX_RECORD_TIME caps the whole recording in any state; the VAD is then
+        flushed so speech still in progress counts as a segment.
+        """
+        chunk_size = int(samplerate * RECORD_CHUNK_DURATION)
+        max_samples = int(MAX_RECORD_TIME * STT_SAMPLE_RATE)
+        leading_samples = int(LEADING_SILENCE_TIME * STT_SAMPLE_RATE)
+        grace_samples = int(LEADING_SILENCE_GRACE * STT_SAMPLE_RATE)
+        resume_samples = int(VAD_RESUME_WINDOW * STT_SAMPLE_RATE)
+        blocks = queue.Queue()
+        raw = []
+
+        def callback(indata, frames, time_info, status):
+            # PortAudio thread: only hand the block over; the VAD runs below
+            blocks.put(indata.copy())
+
+        vad = self.vad
+        vad.reset()
+        fed = 0               # 16 kHz samples given to the VAD so far
+        heard = False         # the VAD has reported speech at least once
+        segments = []         # finished segments as (start, end), 16 kHz samples
+        resume_until = None   # set while resuming: stop when fed reaches it
+        ended = False
+        # Bounds the loop even if the stream stops delivering blocks
+        deadline = time.monotonic() + MAX_RECORD_TIME + 5
+        with sd.InputStream(samplerate=samplerate, channels=1, callback=callback,
+                            device=INPUT_DEVICE_NAME, blocksize=chunk_size):
+            while time.monotonic() < deadline:
+                try:
+                    block = blocks.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                raw.append(block)
+                block = np.clip(np.nan_to_num(block.ravel(), nan=0.0, posinf=0.0, neginf=0.0), -1.0, 1.0)
+                # Per-block resample just for the VAD ("line" padding keeps the
+                # block edges smooth); the utterance itself is resampled whole below
+                samples = resample_to_stt_rate(block, samplerate, padtype="line")
+                vad.accept_waveform(samples)
+                fed += len(samples)
+
+                closed = False  # a segment (speech, then the silence tail) finished
+                while not vad.empty():
+                    seg = vad.front
+                    segments.append((seg.start, seg.start + len(seg.samples)))
+                    vad.pop()
+                    closed = True
+                in_speech = vad.is_speech_detected()
+                if in_speech and not heard:
+                    heard = True
+                    log.info(f"[VAD] Speech started ({fed / STT_SAMPLE_RATE:.2f}s)")
+
+                if closed and not in_speech:
+                    # speaking -> resuming (or stop, with no resume window)
+                    if resume_samples == 0:
+                        ended = True
+                        break
+                    resume_until = fed + resume_samples
+                elif in_speech and resume_until is not None:
+                    # resuming -> speaking: the speaker went on after a pause
+                    log.info(f"[VAD] Speech resumed ({fed / STT_SAMPLE_RATE:.2f}s)")
+                    resume_until = None
+                if resume_until is not None and fed >= resume_until:
+                    ended = True  # resume window passed in silence
+                    break
+                if fed >= max_samples:
+                    break
+                # waiting: no speech by the cutoff, and none being confirmed now
+                if not heard and not in_speech and fed >= leading_samples + grace_samples:
+                    break
+
+        if not ended:
+            vad.flush()  # finalize speech that ran into the time limit
+            while not vad.empty():
+                seg = vad.front
+                segments.append((seg.start, seg.start + len(seg.samples)))
+                vad.pop()
+        if not segments:
+            log.info(f"[VAD] No speech in {fed / STT_SAMPLE_RATE:.1f}s")
+            return None
+        start = segments[0][0]
+        end = segments[-1][1]
+        log.info(f"[VAD] Speech {start / STT_SAMPLE_RATE:.2f}-{end / STT_SAMPLE_RATE:.2f}s "
+                 f"({len(segments)} segment(s)), stopped at {fed / STT_SAMPLE_RATE:.2f}s")
+        audio = self._buffer_to_stt_rate(raw, samplerate)
+        if audio is None:
+            return None
+        # Silero places the start a little into the first word; widen the cut
+        # from the full recording rather than using segment.samples as-is
+        return audio[max(0, start - VAD_PRE_ROLL):end + VAD_POST_ROLL]
+
+    def _record_until_rms_silence(self, samplerate):
+        """Fallback endpointing when the VAD model is missing: stop 1.5 s after
+        the volume drops to the ambient noise floor. Returns 16 kHz float32 or None."""
         silence_threshold = CURRENT_CONFIG["silence_threshold"]
         silence_duration = 1.5
-        max_record_time = 30.0
         buffer = []
         silent_chunks = 0
-        chunk_duration = 0.05
+        chunk_duration = RECORD_CHUNK_DURATION
         chunk_size = int(samplerate * chunk_duration)
 
         num_silent_chunks = int(silence_duration / chunk_duration)
-        num_leading_silence_chunks = int(5.0 / chunk_duration)
-        max_chunks = int(max_record_time / chunk_duration)
+        num_leading_silence_chunks = int(LEADING_SILENCE_TIME / chunk_duration)
+        max_chunks = int(MAX_RECORD_TIME / chunk_duration)
         recorded_chunks = 0
         silence_started = False
         had_speech = False
@@ -1355,7 +1619,7 @@ class BotGUI:
             recent_volumes.append(volume_norm)
             if recorded_chunks < 5: return
             # Room noise often sits above the static threshold, which used to
-            # force every recording to run the full max_record_time. Track the
+            # force every recording to run the full MAX_RECORD_TIME. Track the
             # ambient floor (20th percentile) and compare a smoothed volume
             # against it, capped so loud early speech can't inflate the bar.
             noise_floor = np.percentile(volume_history, 20)
@@ -1371,25 +1635,18 @@ class BotGUI:
                 had_speech = True
                 silent_chunks = 0
 
-        try:
-            # Release any prior stream first — hardware contention freezes the Pi 5
-            self._wait_for_thinking_sound()
-            sd.stop()
-            time.sleep(0.2)
+        with sd.InputStream(samplerate=samplerate, channels=1, callback=callback,
+                            device=INPUT_DEVICE_NAME, blocksize=chunk_size):
+            while not silence_started and recorded_chunks < max_chunks:
+                sd.sleep(int(chunk_duration * 1000))
 
-            with sd.InputStream(samplerate=samplerate, channels=1, callback=callback,
-                                device=INPUT_DEVICE_NAME, blocksize=chunk_size):
-                while not silence_started and recorded_chunks < max_chunks:
-                    sd.sleep(int(chunk_duration * 1000))
-        except Exception as e:
-            log.error(f"[AUDIO ERROR] Adaptive Recording Failed: {e}")
-            return None
+        return self._buffer_to_stt_rate(buffer, samplerate)
 
-        return self.save_audio_buffer(buffer, filename, samplerate)
-
-    def record_voice_ptt(self, filename=None):
+    def record_voice_ptt(self):
+        """Record until Enter is pressed again. Returns 16 kHz float32 samples or None."""
         log.info("Recording (PTT)...")
-        time.sleep(0.5)
+        # As in record_voice_adaptive: the settle is the 0.2 s after sd.stop()
+        time.sleep(0.2)
         samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
 
         buffer = []
@@ -1409,47 +1666,58 @@ class BotGUI:
             self.recording_active.clear()
             return None
 
-        return self.save_audio_buffer(buffer, filename, samplerate)
+        return self._finish_recording(self._buffer_to_stt_rate(buffer, samplerate))
 
-    def save_audio_buffer(self, buffer, filename, samplerate=16000):
-        if not buffer: return None
-        audio_data = np.concatenate(buffer, axis=0).flatten()
-        audio_data = np.nan_to_num(audio_data, nan=0.0, posinf=0.0, neginf=0.0)
-        # Clip first: samples beyond +/-1.0 would wrap around in int16
-        audio_data = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16)
+    def _buffer_to_stt_rate(self, buffer, samplerate):
+        """InputStream callback blocks -> one clean 16 kHz float32 array, or None."""
+        if not buffer:
+            return None
+        audio = np.concatenate(buffer, axis=0).flatten()
+        audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+        return resample_to_stt_rate(np.clip(audio, -1.0, 1.0), samplerate)
+
+    def _finish_recording(self, audio):
+        """Acknowledge a usable recording with the ack sound; pass it through."""
+        if audio is None or not len(audio):
+            return None
+        self.play_sound(self.get_random_sound(ack_sounds_dir))
+        return audio
+
+    def _write_wav(self, audio):
+        """16 kHz float32 samples -> tmp_dir/input.wav for whisper-cli. Path or None."""
+        filename = None
         try:
             self._ensure_tmp_dir()
             # Resolved after _ensure_tmp_dir, which may have moved tmp_dir
-            filename = filename or os.path.join(self.tmp_dir, "input.wav")
+            filename = os.path.join(self.tmp_dir, "input.wav")
+            # Clip first: samples beyond +/-1.0 would wrap around in int16
+            pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
             with wave.open(filename, "wb") as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
-                wf.setframerate(samplerate)
-                wf.writeframes(audio_data.tobytes())
+                wf.setframerate(STT_SAMPLE_RATE)
+                wf.writeframes(pcm.tobytes())
         except OSError as e:
             log.error(f"[AUDIO ERROR] Could not save recording: {e}")
             if filename:
                 self._remove_file(filename)
             return None
-        self.play_sound(self.get_random_sound(ack_sounds_dir))
         return filename
 
-    def _check_audio_energy(self, filename):
+    def _check_audio_energy(self, audio):
         """Return True if audio has enough energy to be worth transcribing."""
         threshold = CURRENT_CONFIG["audio_energy_threshold"]
         try:
-            with wave.open(filename, 'rb') as wf:
-                data = wf.readframes(wf.getnframes())
-            audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-            rms = np.sqrt(np.mean(audio ** 2))
+            rms = float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))))
             log.info(f"[AUDIO] RMS energy: {rms:.6f} (threshold: {threshold})")
             return rms >= threshold
         except Exception as e:
             log.warning(f"[AUDIO] Energy check failed: {e}")
             return True  # transcribe on error to be safe
 
-    def _is_speech(self, transcription):
-        """False for whisper's non-speech annotations and silence hallucinations.
+    def _is_speech(self, transcription, engine):
+        """False for non-speech annotations, bare fillers, and whisper's silence
+        hallucinations.
 
         A false wake word fire on room noise used to reach the LLM as "(wind
         blowing)" and get answered out loud. Whisper is already telling us there
@@ -1464,19 +1732,57 @@ class BotGUI:
             log.info("[AUDIO] Non-speech audio — ignoring.")
             return False
 
-        if normalize_words(residue) in WHISPER_HALLUCINATIONS:
-            # The text itself was already logged (or redacted) as "Heard:"
+        # The text itself was already logged (or redacted) as "Heard:"
+        words = normalize_words(residue)
+        if words in FILLER_UTTERANCES:
+            log.info("[AUDIO] Filler only — ignoring.")
+            return False
+        # Whisper's silence hallucinations. Parakeet doesn't invent text on
+        # silence, so a real "thank you" or "okay" to it must get through.
+        if engine == "whisper" and words in WHISPER_ONLY_HALLUCINATIONS:
             log.info("[AUDIO] Silence hallucination — ignoring.")
             return False
 
         return True
 
-    def transcribe_audio(self, filename):
-        if not self._check_audio_energy(filename):
+    def transcribe_audio(self, audio):
+        """16 kHz float32 samples -> the user's words, or "" for nothing usable."""
+        if not self._check_audio_energy(audio):
             log.info("[AUDIO] Skipping transcription — audio too quiet.")
             return ""
 
         log.info("Transcribing...")
+        engine = "parakeet" if self.recognizer is not None else "whisper"
+        t0 = time.monotonic()
+        if engine == "parakeet":
+            transcription = self._transcribe_parakeet(audio)
+        else:
+            transcription = self._transcribe_whisper(audio)
+        log.info(f"[STT] {engine} {time.monotonic() - t0:.2f}s "
+                 f"({len(audio) / STT_SAMPLE_RATE:.1f}s of audio)")
+        if transcription is None:
+            return ""  # the engine failed; already logged
+        log_transcript("Heard:", transcription)
+        if not self._is_speech(transcription, engine):
+            return ""
+        return transcription.strip()
+
+    def _transcribe_parakeet(self, audio):
+        """Decode in-process on this (main-loop) thread: ~0.2-1.2 s on a Pi 5."""
+        try:
+            stream = self.recognizer.create_stream()
+            stream.accept_waveform(STT_SAMPLE_RATE, audio)
+            self.recognizer.decode_stream(stream)
+            return stream.result.text.strip()
+        except Exception as e:
+            log.error(f"Transcription Error: Parakeet failed: {e}")
+            return None
+
+    def _transcribe_whisper(self, audio):
+        """Run whisper-cli on a temp WAV. Returns the text, or None on failure."""
+        filename = self._write_wav(audio)
+        if filename is None:
+            return None
         whisper_model = CURRENT_CONFIG["whisper_model"]
         whisper_threads = str(CURRENT_CONFIG["whisper_threads"])
         try:
@@ -1486,20 +1792,19 @@ class BotGUI:
             )
             if result.returncode != 0:
                 log.error(f"Transcription Error: whisper-cli exited {result.returncode}: {result.stderr.strip()[-300:]}")
-                return ""
+                return None
             # whisper-cli prints one timestamped line per segment; join them all
             segments = [WHISPER_TIMESTAMP_RE.sub("", line).strip() for line in result.stdout.split('\n')]
-            transcription = " ".join(seg for seg in segments if seg)
-            log_transcript("Heard:", transcription)
-            if not self._is_speech(transcription):
-                return ""
-            return transcription.strip()
+            return " ".join(seg for seg in segments if seg)
         except subprocess.TimeoutExpired:
             log.error("Transcription Error: whisper-cli timed out after 90s")
-            return ""
+            return None
         except Exception as e:
             log.error(f"Transcription Error: {e}")
-            return ""
+            return None
+        finally:
+            # The WAV exists only for whisper-cli; don't leave the recording on disk
+            self._remove_file(filename)
 
     def capture_image(self):
         self.set_state(BotStates.CAPTURING, "Watching...")
