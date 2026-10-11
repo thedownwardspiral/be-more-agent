@@ -1,7 +1,7 @@
 [project]
 name = "be-more-agent"
 version = "0.1.0"
-description = "A Raspberry Pi conversational AI agent with wake word, whisper.cpp STT, Claude, and Piper TTS"
+description = "A Raspberry Pi conversational AI agent with wake word, Parakeet STT, Claude, and Piper TTS"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -18,6 +18,13 @@ dependencies = [
     "ddgs",
     "Pillow",
     "piper-tts",
+    # In-process speech-to-text (Parakeet) and voice activity detection (Silero).
+    # sherpa-onnx-core ships the libonnxruntime.so it links against. It is listed
+    # explicitly because some sherpa-onnx wheels (linux_armv7l) omit that
+    # dependency and uv locks from them, leaving aarch64 with an unimportable
+    # module. The two must stay on the same version.
+    "sherpa-onnx==1.13.8",
+    "sherpa-onnx-core==1.13.8",
 ]
 
 # agent.py is a single top-level script, not an installable package.

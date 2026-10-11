@@ -25,7 +25,7 @@ piper/
 # llama.cpp build
 llama.cpp/
 
-# GGUF model files
+# Downloaded models: Parakeet speech-to-text and Silero VAD (setup.sh), GGUF files
 models/
 
 # llama-swap binary
