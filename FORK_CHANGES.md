@@ -475,3 +475,4 @@ fallback.
 - **Attribution**: Parakeet-TDT 0.6B v2 is CC-BY-4.0 (NVIDIA); credited in
   the README's Acknowledgments. The model is downloaded by setup.sh, not
   committed.
+- **Tool trace in memory**: each saved reply records the tools that produced it (`"tools": [...]` in memory.json), sent to Claude as a `[tools used: ...]` note, and the system prompt says not to "correct" earlier answers, so Claude stops apologizing for times and photos it really did fetch.

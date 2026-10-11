@@ -457,7 +457,8 @@ WHISPER_ONLY_HALLUCINATIONS = {normalize_words(p) for p in (
 
 def is_valid_memory(history):
     """True if history is a well-formed memory.json: a system entry first, then
-    user/assistant entries only, each with non-empty string content."""
+    user/assistant entries only, each with non-empty string content. An entry
+    may carry an optional "tools" key: a list of tool-name strings."""
     if not isinstance(history, list) or not history:
         return False
     for i, m in enumerate(history):
@@ -470,6 +471,10 @@ def is_valid_memory(history):
         content = m.get("content")
         if not isinstance(content, str) or not content.strip():
             return False
+        if "tools" in m:
+            tools = m["tools"]
+            if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
+                return False
     return True
 
 # Memory wipe fires only when the *whole* utterance is the command (after a
@@ -589,6 +594,10 @@ user asks for something a tool provides; otherwise just chat.
 
 Your replies are spoken aloud, so keep them short and conversational.
 You cannot erase your own memory; if asked to, tell the user to say "forget everything".
+Your earlier replies in this conversation are stored as text; the tool calls and
+results that produced them are not kept, except as a short "[tools used: ...]" note.
+Treat earlier answers as having been produced correctly at the time; do not
+apologize for or "correct" them unless the user asks.
 """
 
 SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n\n" + CURRENT_CONFIG["system_prompt_extras"]
@@ -1832,13 +1841,18 @@ class BotGUI:
     # =========================================================================
 
     def _history_messages(self):
-        """Chat history as Anthropic messages (skips legacy system entries)."""
+        """Chat history as Anthropic messages (skips legacy system entries).
+        A reply's tool trace is rendered as a note after its text, so Claude
+        can see the earlier answer was backed by a real tool call."""
         history = []
         recent = [m for m in (self.permanent_memory + self.session_memory) if m["role"] != "system"]
         for msg in recent[-MAX_HISTORY_MESSAGES:]:
             if not history and msg["role"] != "user":
                 continue  # API conversations must start with a user message
-            history.append(msg)
+            content = msg["content"]
+            if msg["role"] == "assistant" and msg.get("tools"):
+                content += f"\n[tools used: {', '.join(msg['tools'])}]"
+            history.append({"role": msg["role"], "content": content})
         return history
 
     def chat_and_respond(self, text):
@@ -1885,6 +1899,9 @@ class BotGUI:
         self._start_thinking_sound()
 
         full_response_text = ""
+        # Names of tools actually run this turn (successful or failed), in
+        # first-use order with repeats dropped; saved with the reply.
+        tools_used = []
         # Once anything has gone to TTS, later chunks use the longer
         # TTS_MIN_SENTENCE_LENGTH. Reset after each tool round, so the first
         # sentence after a (silent) tool call also starts quickly.
@@ -1982,6 +1999,8 @@ class BotGUI:
                             "is_error": True
                         })
                         continue
+                    if block.name not in tools_used:
+                        tools_used.append(block.name)
                     try:
                         result_content, is_error = self.execute_tool(block.name, block.input)
                         tool_result = {
@@ -2030,7 +2049,10 @@ class BotGUI:
             if not self.interrupted.is_set():
                 self.session_memory.append({"role": "user", "content": text})
                 if full_response_text.strip():
-                    self.session_memory.append({"role": "assistant", "content": full_response_text})
+                    reply = {"role": "assistant", "content": full_response_text}
+                    if tools_used:
+                        reply["tools"] = tools_used
+                    self.session_memory.append(reply)
                 if len(self.session_memory) > MAX_HISTORY_MESSAGES:
                     del self.session_memory[:-MAX_HISTORY_MESSAGES]
                 self.save_chat_history()
@@ -2262,7 +2284,8 @@ class BotGUI:
         # and taking the snapshot under it means saves land in the order taken.
         with self.memory_lock:
             # The system entry is rebuilt from the current prompt rather than
-            # trusting position 0; only the conversation itself is carried over.
+            # trusting position 0; only the conversation itself is carried over
+            # (entries as-is, so a reply's optional "tools" trace is kept).
             conv = [m for m in (self.permanent_memory + self.session_memory) if m.get("role") != "system"]
             if len(conv) > 10: conv = conv[-10:]
             data = [{"role": "system", "content": SYSTEM_PROMPT}] + conv
