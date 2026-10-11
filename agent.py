@@ -208,6 +208,72 @@ TTS_SENTENCE_END_RE = re.compile(r'[.!?…]+["\'”’)\]]*(?=\s)')
 TTS_ABBREVIATION_RE = re.compile(
     r'(?i)^(?:(?:[a-z]\.)*[a-z]|\d{1,2}|mr|mrs|ms|dr|st|jr|sr|vs|etc|prof|mt|no)$'
 )
+# The "[tools used: ...]" note _history_messages() appends to earlier replies.
+# Claude may imitate it in a new reply, where it would be spoken, shown and
+# saved as if it were a real tool trace; ToolNoteFilter removes it.
+TOOL_NOTE_RE = re.compile(r"\s*\[tools used:[^\]]*\]\s*")
+TOOL_NOTE_PREFIX = "[tools used:"
+
+
+class ToolNoteFilter:
+    """Removes imitated "[tools used: ...]" notes from streamed reply text.
+
+    A note can be split across stream deltas, so text from a "[" that could
+    still start a note is held back until it either diverges from the prefix
+    (emitted unchanged, so "[laughs]" or "array[3]" pass through) or closes
+    with "]" (dropped, with the whitespace after it). Everything downstream
+    (screen, TTS, memory) sees only filtered text. One instance per turn;
+    `stripped` records whether anything was removed.
+    """
+
+    def __init__(self):
+        self.pending = ""
+        self.skip_ws = False  # drop whitespace that follows a removed note
+        self.stripped = False
+
+    def feed(self, text):
+        if self.skip_ws:
+            text = text.lstrip()
+            if not text:
+                return ""
+            self.skip_ws = False
+        self.pending += text
+        out = []
+        while self.pending:
+            i = self.pending.find("[")
+            if i < 0:
+                out.append(self.pending)
+                self.pending = ""
+                break
+            out.append(self.pending[:i])
+            tail = self.pending[i:]
+            if not (tail.startswith(TOOL_NOTE_PREFIX) or TOOL_NOTE_PREFIX.startswith(tail)):
+                out.append("[")  # not a note: emit and look past this "["
+                self.pending = tail[1:]
+                continue
+            m = TOOL_NOTE_RE.match(tail)
+            if m is None:
+                self.pending = tail  # incomplete; wait for more text
+                break
+            self.stripped = True
+            self.pending = tail[m.end():]
+            if not self.pending:
+                self.skip_ws = True
+        return "".join(out)
+
+    def flush(self):
+        """End of a round: release held text (an unclosed note is dropped)."""
+        text, self.pending, self.skip_ws = self.pending, "", False
+        if text.startswith(TOOL_NOTE_PREFIX):
+            self.stripped = True
+            return ""
+        return text
+
+    def filter(self, deltas):
+        """Yield deltas with notes removed, then whatever was held back."""
+        for delta in deltas:
+            yield self.feed(delta)
+        yield self.flush()
 
 
 def last_sentence_end(buffer):
@@ -596,8 +662,9 @@ Your replies are spoken aloud, so keep them short and conversational.
 You cannot erase your own memory; if asked to, tell the user to say "forget everything".
 Your earlier replies in this conversation are stored as text; the tool calls and
 results that produced them are not kept, except as a short "[tools used: ...]" note.
-Treat earlier answers as having been produced correctly at the time; do not
-apologize for or "correct" them unless the user asks.
+An earlier reply marked [tools used: ...] was produced by a real tool call at the
+time (a clock reading, a search, a photo); do not apologize for it or claim it was
+made up. You may still correct a plain factual mistake if later information shows one.
 """
 
 SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n\n" + CURRENT_CONFIG["system_prompt_extras"]
@@ -1908,6 +1975,8 @@ class BotGUI:
         first_chunk_sent = False
         # Set when the tool-free last round below still produced no text
         gave_up = False
+        # Drops "[tools used: ...]" notes Claude copies from its history
+        note_filter = ToolNoteFilter()
 
         try:
             client = get_llm_client()
@@ -1927,7 +1996,7 @@ class BotGUI:
                     model=TEXT_MODEL, messages=messages, system=SYSTEM_PROMPT,
                     tools=turn_tools, max_tokens=MAX_RESPONSE_TOKENS, **round_kwargs, **LLM_KWARGS
                 ) as stream:
-                    for content in stream.text_stream:
+                    for content in note_filter.filter(stream.text_stream):
                         if self.interrupted.is_set(): break
                         if not content: continue
                         if not round_started:
@@ -2045,6 +2114,11 @@ class BotGUI:
                     fallback = " " + fallback
                 self.append_to_text(fallback, newline=False)
                 self.tts_queue.put(fallback.strip())
+                # Save what was said, not the unfinished reply on its own
+                full_response_text += fallback
+
+            if note_filter.stripped:
+                log.warning("[LLM] stripped an imitated tools note from the reply")
 
             if not self.interrupted.is_set():
                 self.session_memory.append({"role": "user", "content": text})
