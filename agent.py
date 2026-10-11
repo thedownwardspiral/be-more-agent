@@ -775,6 +775,13 @@ TTS_SYMBOL_SUBS = [
     (re.compile(r"#(?=\d)"), " number "),
 ]
 
+# Marks the end of one tts_queue item's audio on BotGUI.audio_queue
+TTS_ITEM_END = object()
+# TTS playback writes this many int16 frames at a time and checks for an
+# interrupt between writes (~93 ms at 22050 Hz)
+TTS_WRITE_FRAMES = 2048
+TTS_WRITE_BYTES = TTS_WRITE_FRAMES * 2
+
 def normalize_for_tts(text):
     """Make text speakable: spell out symbols, then drop emoji and other non-speech characters."""
     for pattern, replacement in TTS_SYMBOL_SUBS:
@@ -845,9 +852,21 @@ class BotGUI:
         self.ptt_lock = threading.Lock()
         self.interrupted = threading.Event() 
         
+        # Two-stage TTS: the synth thread turns tts_queue text into PCM on
+        # audio_queue while the playback thread plays the previous sentence
         self.tts_queue = queue.Queue()
         self.tts_thread = None
+        # Set while the synth thread works on an item
         self.tts_active = threading.Event()
+        # (int16 bytes, sample rate) chunks and TTS_ITEM_END markers; bounded
+        # so synthesis can't run far ahead of what is being heard
+        self.audio_queue = queue.Queue(maxsize=16)
+        self.playback_thread = None
+        # Clear while the playback thread has its output stream open
+        self.playback_idle = threading.Event()
+        self.playback_idle.set()
+        # voice sample rate -> (stream rate, resample?), see _playback_format
+        self._playback_formats = {}
         self.turn_cam_path = None
         # True while the text box ends in an unfinished "BOT: ..." line. Only
         # the main-loop thread appends conversation text, so it owns this flag.
@@ -1078,6 +1097,11 @@ class BotGUI:
             sd.stop()
         except Exception:
             pass
+        # The playback thread sees exiting within ~0.1 s and aborts/closes
+        # its own stream (never closed from here: another thread's stream)
+        t = self.playback_thread
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=0.5)
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
         # Released only after the dir is gone, so no sweep can race the rmtree.
         # Under the guard: the main loop may be in _lock_tmp_dir right now.
@@ -1362,9 +1386,7 @@ class BotGUI:
     def safe_main_execution(self):
         try:
             self.warm_up_logic()
-            self.tts_active.clear()
-            self.tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
-            self.tts_thread.start()
+            self._start_tts_threads()
             
             while True:
                 # One bad turn must not stop the bot listening for good
@@ -1410,6 +1432,9 @@ class BotGUI:
                     # detect_wake_word_or_ptt may have raised mid-wait
                     self.awaiting_input.clear()
                     self.thinking_sound_active.clear()
+                    # Never reopen the mic with the TTS stream still open
+                    self.wait_for_tts()
+                    self.interrupted.clear()
                     self._end_bot_line()
                     self.set_state(BotStates.ERROR, "Something went wrong")
                     time.sleep(2)
@@ -2206,23 +2231,82 @@ class BotGUI:
             self._ui(self._remove_file, cam_path)
 
     def wait_for_tts(self):
+        """Block until everything queued so far has been SPOKEN: synthesized,
+        written to the device, heard, and the stream closed. Every recording
+        path calls this first, so the mic never opens while TTS plays. Interrupts can't
+        deadlock it: the synth stage skips items while interrupted is set and
+        the playback stage drains audio_queue and goes idle on its own."""
         self.tts_queue.join()
+        self.audio_queue.join()
+        if not self.playback_idle.wait(timeout=10):
+            log.warning("[TTS] Playback did not go idle within 10 s")
+
+    def _tts_busy(self):
+        """True while speech is queued, being synthesized, or playing."""
+        return (self.tts_active.is_set() or not self.tts_queue.empty()
+                or not self.audio_queue.empty() or not self.playback_idle.is_set())
+
+    def _start_tts_threads(self):
+        self.tts_active.clear()
+        self.playback_idle.set()
+        self.tts_thread = threading.Thread(target=self._tts_worker, name="tts-synth", daemon=True)
+        self.playback_thread = threading.Thread(target=self._playback_worker, name="tts-playback", daemon=True)
+        self.tts_thread.start()
+        self.playback_thread.start()
+
+    def _playback_format(self, voice_rate):
+        """(rate to open the output stream at, whether to resample), decided
+        once per voice sample rate: the voice's own rate if the device takes
+        it, else the device's default rate."""
+        fmt = self._playback_formats.get(voice_rate)
+        if fmt is None:
+            try:
+                sd.check_output_settings(device=None, samplerate=voice_rate)
+                fmt = (voice_rate, False)
+            except Exception:
+                try:
+                    native_rate = int(sd.query_devices(kind='output')['default_samplerate'])
+                except Exception:
+                    native_rate = 48000
+                fmt = (native_rate, True)
+            self._playback_formats[voice_rate] = fmt
+        return fmt
+
+    def _put_audio(self, item):
+        """Enqueue for playback, blocking while audio_queue is full. Gives up
+        (returns False) only on exit; on an interrupt the playback stage
+        drains the queue, so a blocked put always gets through."""
+        while not self.exiting:
+            try:
+                self.audio_queue.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def _tts_worker(self):
-        while True:
+        """Synthesis stage: text from tts_queue -> PCM chunks on audio_queue.
+        Runs ahead of playback, so the next sentence is ready by the time the
+        current one finishes playing."""
+        while not self.exiting:
             try:
                 text = self.tts_queue.get(timeout=0.05)
             except queue.Empty:
                 continue
-            if self.interrupted.is_set():
+            try:
+                if self.interrupted.is_set():
+                    continue
+                self.tts_active.set()
+                self._synthesize(text)
+            except Exception as e:
+                log.error(f"[PIPER] Synthesis failed: {e}")
+            finally:
+                self.tts_active.clear()
+                # Only now: every chunk of this item is already on audio_queue,
+                # so wait_for_tts's audio_queue.join() covers all of it
                 self.tts_queue.task_done()
-                continue
-            self.tts_active.set()
-            self.speak(text)
-            self.tts_active.clear()
-            self.tts_queue.task_done()
 
-    def speak(self, text):
+    def _synthesize(self, text):
         clean = normalize_for_tts(text)
         if not clean.strip(): return
         if self.piper_voice is None:
@@ -2231,63 +2315,134 @@ class BotGUI:
 
         log_transcript("[PIPER SPEAKING]", clean)
 
-        try:
-            device_info = sd.query_devices(kind='output')
-            native_rate = int(device_info['default_samplerate'])
-        except Exception:
-            native_rate = 48000
-
-        stream = None
-        playback_rate = None
-        resample = False
-        chunk_size = 2048
-        byte_step = chunk_size * 2  # 2 bytes per int16 sample
-
+        started = False
         try:
             for chunk in self.piper_voice.synthesize(clean):
-                if self.interrupted.is_set():
+                if self.interrupted.is_set() or self.exiting:
                     break
-
-                # Lazily open the output stream on the first chunk so we know the voice's sample rate.
-                if stream is None:
-                    voice_rate = chunk.sample_rate
-                    try:
-                        sd.check_output_settings(device=None, samplerate=voice_rate)
-                        playback_rate = voice_rate
-                    except Exception:
-                        playback_rate = native_rate
-                        resample = True
-                    stream = sd.RawOutputStream(
-                        samplerate=playback_rate, channels=1, dtype='int16',
-                        device=None, latency='low', blocksize=chunk_size,
-                    )
-                    stream.start()
-
+                rate, resample = self._playback_format(chunk.sample_rate)
                 audio = np.frombuffer(chunk.audio_int16_bytes, dtype=np.int16)
                 if resample:
-                    num_samples = int(len(audio) * (playback_rate / chunk.sample_rate))
+                    num_samples = int(len(audio) * (rate / chunk.sample_rate))
                     audio = scipy.signal.resample(audio, num_samples).astype(np.int16)
-
-                audio_bytes = audio.tobytes()
-                for i in range(0, len(audio_bytes), byte_step):
-                    if self.interrupted.is_set():
-                        break
-                    stream.write(audio_bytes[i:i + byte_step])
-
-            # Let the device drain its buffered audio before stop() so the
-            # end of the reply isn't clipped. When another sentence is
-            # already queued, keep the gap short so the reply flows.
-            if stream is not None and not self.interrupted.is_set():
-                time.sleep(0.05 if not self.tts_queue.empty() else 0.5)
-
-        except Exception as e:
-            log.error(f"Audio Error: {e}")
+                if not self._put_audio((audio.tobytes(), rate)):
+                    break
+                started = True
         finally:
-            if stream is not None:
-                try: stream.stop()
-                except Exception: pass  # best-effort cleanup
-                try: stream.close()
-                except Exception: pass  # best-effort cleanup
+            # Tells playback this item is complete, so a slow synthesis
+            # mid-item doesn't make it close the stream
+            if started:
+                self._put_audio(TTS_ITEM_END)
+
+    def _close_stream(self, stream, drain_frames=0):
+        """drain_frames > 0: let everything written be heard, then stop().
+        0: abort() drops the buffer at once (interrupt, exit, error).
+
+        stop() alone does NOT wait for buffered audio here: on the Pi's ALSA
+        "default" device (PulseAudio plugin) it returns at once and cuts the
+        last ~0.25 s. So draining writes silence first: once a buffer's worth
+        plus a margin of zeros has gone in, the real audio has been played
+        and stop() drops only silence. The writes block, so this also times
+        the end of the reply for wait_for_tts."""
+        drain = drain_frames > 0
+        try:
+            if drain:
+                silence = bytes(2 * drain_frames)
+                for i in range(0, len(silence), TTS_WRITE_BYTES):
+                    if self.interrupted.is_set() or self.exiting:
+                        drain = False
+                        break
+                    stream.write(silence[i:i + TTS_WRITE_BYTES])
+            if drain:
+                stream.stop()
+            else:
+                stream.abort()
+        except Exception:
+            pass  # best-effort cleanup
+        try:
+            stream.close()
+        except Exception:
+            pass  # best-effort cleanup
+
+    def _playback_worker(self):
+        """Playback stage: owns the only RawOutputStream TTS uses. Opens it on
+        the first chunk of a reply, keeps it open across sentences, and
+        drains and closes it once nothing more is queued or being
+        synthesized. All stream calls, including the abort on an interrupt,
+        happen on this thread."""
+        stream = None
+        stream_rate = None
+        drain_frames = 0
+        in_item = False  # a chunk was played and its item's end hasn't arrived
+
+        while True:
+            if self.exiting:
+                if stream is not None:
+                    self._close_stream(stream)
+                self.playback_idle.set()
+                return
+
+            if self.interrupted.is_set() and (stream is not None or in_item):
+                if stream is not None:
+                    self._close_stream(stream)
+                stream = None
+                in_item = False
+                while True:
+                    try:
+                        self.audio_queue.get_nowait()
+                        self.audio_queue.task_done()
+                    except queue.Empty:
+                        break
+                self.playback_idle.set()
+
+            try:
+                item = self.audio_queue.get(timeout=0.02)
+            except queue.Empty:
+                # End of the reply (or of what has been streamed so far):
+                # _close_stream returns once everything written has been heard
+                if (stream is not None and not in_item and not self.tts_active.is_set()
+                        and self.tts_queue.empty()):
+                    self._close_stream(stream, drain_frames)
+                    stream = None
+                    self.playback_idle.set()
+                continue
+
+            try:
+                if item is TTS_ITEM_END:
+                    in_item = False
+                    continue
+                if self.interrupted.is_set() or self.exiting:
+                    continue  # stale audio from an interrupted reply
+                in_item = True
+                audio_bytes, rate = item
+                if stream is not None and rate != stream_rate:
+                    self._close_stream(stream, drain_frames)
+                    stream = None
+                if stream is None:
+                    self.playback_idle.clear()
+                    stream = sd.RawOutputStream(
+                        samplerate=rate, channels=1, dtype='int16',
+                        device=None, latency='low', blocksize=TTS_WRITE_FRAMES,
+                    )
+                    stream_rate = rate
+                    stream.start()
+                    # Silence _close_stream writes to flush the device buffer
+                    # before stop(): the buffer, or the reported latency if
+                    # larger, plus 0.15 s for the sound server behind it
+                    drain_frames = (max(stream.write_available, int(stream.latency * rate))
+                                    + int(0.15 * rate))
+                for i in range(0, len(audio_bytes), TTS_WRITE_BYTES):
+                    if self.interrupted.is_set() or self.exiting:
+                        break
+                    stream.write(audio_bytes[i:i + TTS_WRITE_BYTES])
+            except Exception as e:
+                log.error(f"Audio Error: {e}")
+                if stream is not None:
+                    self._close_stream(stream)
+                    stream = None
+                self.playback_idle.set()
+            finally:
+                self.audio_queue.task_done()
 
     def _start_thinking_sound(self):
         # One loop thread at most: two threads calling sd.play() crash PortAudio
@@ -2301,7 +2456,7 @@ class BotGUI:
         while self.thinking_sound_active.is_set():
             # Thinking sounds are voice clips — never play one while TTS is
             # speaking or has speech queued, or it sounds like two voices
-            if self.tts_active.is_set() or not self.tts_queue.empty():
+            if self._tts_busy():
                 time.sleep(0.1)
                 continue
             sound = self.get_random_sound(thinking_sounds_dir)
@@ -2340,8 +2495,7 @@ class BotGUI:
                 # never overlap, and once thinking has ended (reply text
                 # arrived, a spacebar interrupt, the end of the turn), so no
                 # clip outlives the turn into the next recording
-                if (self.tts_active.is_set() or not self.tts_queue.empty()
-                        or not self.thinking_sound_active.is_set()):
+                if self._tts_busy() or not self.thinking_sound_active.is_set():
                     sd.stop()
                     return
                 time.sleep(0.05)
