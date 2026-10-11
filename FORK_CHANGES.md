@@ -536,9 +536,14 @@ up to 20 s for `rpicam-still`. Each span now checks every `INTERRUPT_POLL`
   opens later is closed by the helper). Closing the client does not stop a
   request still waiting for headers (tested), so a thread is needed here.
 - **API stream, while reading**: the open stream is kept in `active_stream`;
-  `handle_speaking_interrupt` closes it from the Tk thread, and the blocked
-  read raises `httpx.ReadError` within ~60-90 ms (measured), which the stream
-  block treats as the interrupt instead of an error.
+  `handle_speaking_interrupt` shuts its socket down and closes it from the Tk
+  thread, so a blocked read wakes immediately and raises `httpx.ReadError`,
+  which the stream block treats as the interrupt instead of an error. The
+  shutdown matters: on Linux, closing the fd alone does not wake a thread
+  blocked on it, so a stalled stream would wait out the 60 s read timeout.
+  `_open_stream()` doesn't send at all if `interrupted` is already set (the
+  helper re-checks just before sending), and an abandoned helper's request
+  error is logged at debug.
 - **search_web**: both DDG searches run on an abandoned-on-interrupt daemon
   thread (`_run_interruptible`), with a 20 s overall cap and an explicit 5 s
   per-backend ddgs timeout.

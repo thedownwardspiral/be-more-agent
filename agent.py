@@ -83,6 +83,7 @@ import wave
 import queue
 import collections
 import signal
+import socket
 import stat
 import shutil
 import tempfile
@@ -1182,15 +1183,30 @@ class BotGUI:
             self.set_state(BotStates.IDLE, "Interrupted.")
 
     def _cancel_active_stream(self):
-        """Close the response stream the main loop is reading, so a reader
-        blocked waiting for the next chunk wakes at once (with an
-        httpx.ReadError, which chat_and_respond treats as the interrupt)."""
+        """Shut down and close the response stream the main loop is reading,
+        so a reader blocked waiting for the next chunk wakes at once (with an
+        httpx.ReadError, which chat_and_respond treats as the interrupt).
+        close() alone isn't enough: on Linux, closing a socket fd does not wake
+        a thread blocked in poll/recv on it, so a stalled stream would sit
+        until the 60s read timeout. shutdown() does wake it."""
         s = self.active_stream
-        if s is not None:
+        if s is None:
+            return
+        sock = None
+        try:
+            sock = s.response.extensions["network_stream"].get_extra_info("socket")
+        except Exception as e:
+            # Some transports don't expose the socket; close() still runs
+            log.debug(f"[LLM] No socket to shut down on interrupt: {e!r}")
+        if sock is not None:
             try:
-                s.close()
+                sock.shutdown(socket.SHUT_RDWR)
             except Exception as e:
-                log.debug(f"[LLM] Closing the stream on interrupt failed: {e!r}")
+                log.debug(f"[LLM] Shutting the socket down on interrupt failed: {e!r}")
+        try:
+            s.close()
+        except Exception as e:
+            log.debug(f"[LLM] Closing the stream on interrupt failed: {e!r}")
 
     def load_animations(self):
         base_path = "faces"
@@ -2050,16 +2066,27 @@ class BotGUI:
         connection (up to 60s per attempt, with a retry). Returns the open
         MessageStream, or None if interrupted first; an abandoned helper
         closes the stream itself if it opens later. Re-raises request errors."""
-        manager = client.messages.stream(**kwargs)
+        if self.interrupted.is_set():
+            log.info("[LLM] Interrupted before the request was sent; not sending it")
+            return None
         box = {}
         lock = threading.Lock()
 
         def run():
+            # Last check before anything goes on the wire: the main loop may
+            # already have given up on this helper
+            with lock:
+                if box.get("abandoned") or self.interrupted.is_set():
+                    box["abandoned"] = True
+                    return
             try:
-                opened = manager.__enter__()
+                opened = client.messages.stream(**kwargs).__enter__()
             except BaseException as e:
                 with lock:
-                    box["error"] = e
+                    if not box.get("abandoned"):
+                        box["error"] = e
+                        return
+                log.debug(f"[LLM] Abandoned request failed: {_err_summary(e)}")
                 return
             with lock:
                 if not box.get("abandoned"):
