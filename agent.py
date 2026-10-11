@@ -123,7 +123,6 @@ PRIVATE_FILES = [".env", MEMORY_FILE, "agent.log"] + \
 
 DEFAULT_CONFIG = {
     # Claude Haiku 5.5, paired with temperature null and effort "low" below.
-    # To go back to claude-haiku-4-5, also set temperature 0.7 and effort null.
     "text_model": "claude-haiku-5-5",
     "voice_model": "piper/en_US-bmo-medium.onnx",
     "whisper_model": "./whisper.cpp/models/ggml-base.en.bin",
@@ -153,12 +152,10 @@ DEFAULT_CONFIG = {
         "what is this", "what's this", "what am i holding", "describe this"
     ],
     # Sampling temperature, 0.0-1.0. Default null omits it, as Claude 5.x models
-    # such as the default claude-haiku-5-5 reject non-default values. Use 0.7
-    # with claude-haiku-4-5.
+    # such as the default claude-haiku-5-5 reject non-default values.
     "temperature": None,
-    # Thinking effort: "low", "medium" or "high". Default "low" keeps 5.x voice
-    # replies fast (5.x models think by default). null omits it, which is
-    # required for claude-haiku-4-5 (it rejects effort).
+    # Thinking effort: "low", "medium" or "high". Default "low" keeps voice
+    # replies fast (thinking is on by default). null omits it.
     "effort": "low"
 }
 
@@ -308,9 +305,8 @@ if CURRENT_CONFIG["effort"] is not None:
     LLM_KWARGS["output_config"] = {"effort": CURRENT_CONFIG["effort"]}
 
 # Cap for each chat response. Thinking tokens count toward it, so allow 4096
-# when effort is set or temperature is null (the Claude 5.x setup, which is the
-# default; those models think by default) so a long think still leaves room for
-# the reply. The claude-haiku-4-5 setup (temperature set, effort null) gets 1024.
+# when effort is set or temperature is null (as in the default setup, where
+# thinking is on) so a long think still leaves room for the reply; otherwise 1024.
 MAX_RESPONSE_TOKENS = 4096 if (CURRENT_CONFIG["effort"] or CURRENT_CONFIG["temperature"] is None) else 1024
 
 def restrict_private_files():

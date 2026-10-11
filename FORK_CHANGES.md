@@ -400,8 +400,7 @@ The bundled `sounds/*.wav` clips were deleted earlier (07c0230); the
   shared by chat and warm-up via `LLM_KWARGS` (warm-up `max_tokens` is
   32).
 - **Default model**: now Claude Haiku 5.5 (`claude-haiku-5-5`) with
-  `temperature` null and `effort` "low"; to go back to `claude-haiku-4-5`,
-  set `"temperature": 0.7, "effort": null`.
+  `temperature` null and `effort` "low".
 
 ### Code quality
 

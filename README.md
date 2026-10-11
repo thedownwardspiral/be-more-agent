@@ -185,17 +185,7 @@ Every key is optional; anything you leave out uses its default. Values are check
 | `temperature` | Sampling temperature, `0.0`–`1.0` (default: `null`, which leaves it out so the model's default applies) |
 | `effort` | Thinking effort: `"low"`, `"medium"` or `"high"` (default: `"low"`). `null` means not sent |
 
-### Using an older model
-
-The default `claude-haiku-5-5` works with the defaults above (`"effort": "low"` keeps spoken replies fast). To go back to Claude Haiku 4.5, set these three keys together:
-
-```json
-"text_model": "claude-haiku-4-5",
-"temperature": 0.7,
-"effort": null
-```
-
-The parameters are not interchangeable: Claude 5.x models reject a non-default `temperature`, while `claude-haiku-4-5` rejects `effort`. A mismatch fails at startup with "Can't reach Claude" (see Troubleshooting). The same applies if you set `ANTHROPIC_MODEL` in `.env`.
+If you change `text_model` (or set `ANTHROPIC_MODEL` in `.env`, which overrides it), the `temperature`/`effort` keys must suit the model you choose; a mismatch fails at startup with "Can't reach Claude" (see Troubleshooting).
 
 ### Privacy & files
 
@@ -222,7 +212,7 @@ This software is a generic framework. You can give it a new personality by repla
 * **`couldn't connect to display ":0"` error:** The Pi must be running a desktop environment (X11 or Wayland). If you installed Raspberry Pi OS Lite (server/headless), you need to install `lightdm` and configure desktop autologin via `sudo raspi-config` — see [Display Requirements](#️-display-requirements). If running over SSH, ensure the desktop is already active on the Pi. You can override the target display with `DISPLAY=:1 python agent.py` if needed.
 * **"AuthenticationError" or API key errors:** Ensure your `.env` file exists and contains a valid `ANTHROPIC_API_KEY`. Copy from `example.env` if needed.
 * **`[CONFIG]` warnings at startup:** Config problems are reported in the console and `agent.log` when the agent starts. A bad value or unknown key is skipped (its default is used); if `config.json` is not valid JSON, the **whole file is ignored** with a loud error banner and every setting is at its default, so fix the syntax and restart.
-* **Startup shows "Can't reach Claude: check API key / network":** The warm-up request failed. Check `ANTHROPIC_API_KEY` in `.env`, the network connection, and that `text_model`/`temperature`/`effort` match (see [Using an older model](#using-an-older-model)). The exact API error is in `agent.log`.
+* **Startup shows "Can't reach Claude: check API key / network":** The warm-up request failed. Check `ANTHROPIC_API_KEY` in `.env`, the network connection, and that the `temperature`/`effort` keys suit `text_model`. The exact API error is in `agent.log`.
 * **"No search library found":** If web search fails, ensure you are in the `.venv` virtual environment and `ddgs` is installed (`uv sync`).
 * **Shutdown Errors:** When you exit the script (Ctrl+C), you might see `Expression 'alsa_snd_pcm_mmap_begin' failed`. **This is normal.** It just means the audio stream was cut off mid-sample. It does not affect the functionality.
 * **Audio Glitches:** If the voice sounds fast or slow, the script attempts to auto-detect sample rates. Ensure your `config.json` points to a valid `.onnx` voice model in the `piper/` folder (with its sibling `.onnx.json` next to it). To switch voices, run `uv run python -m piper.download_voices --data-dir piper <voice-name>`.
