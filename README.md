@@ -134,8 +134,8 @@ Copy `example.env` to `.env` and configure:
 # Anthropic API key (required)
 ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
-# Model override (optional, defaults to claude-haiku-4-5)
-# ANTHROPIC_MODEL=claude-haiku-4-5
+# Model override (optional, defaults to claude-haiku-5-5)
+# ANTHROPIC_MODEL=claude-haiku-5-5
 ```
 
 The `.env` file is gitignored and will never be committed. Keep it private with `chmod 600 .env` (the agent and `setup.sh` also tighten it to mode 600 if it is looser).
@@ -146,7 +146,7 @@ You can modify the hardware behavior and personality in `config.json`:
 
 ```json
 {
-    "text_model": "claude-haiku-4-5",
+    "text_model": "claude-haiku-5-5",
     "voice_model": "piper/en_US-bmo-medium.onnx",
     "whisper_model": "./whisper.cpp/models/ggml-base.en.bin",
     "whisper_threads": 3,
@@ -157,8 +157,8 @@ You can modify the hardware behavior and personality in `config.json`:
     "system_prompt_extras": "You are a helpful robot assistant. Keep responses short and cute.",
     "input_device": null,
     "input_sample_rate": null,
-    "temperature": 0.7,
-    "effort": null
+    "temperature": null,
+    "effort": "low"
 }
 ```
 
@@ -166,7 +166,7 @@ Every key is optional; anything you leave out uses its default. Values are check
 
 | Key | Description |
 |-----|-------------|
-| `text_model` | Anthropic model name (overridden by `ANTHROPIC_MODEL` env var if set) |
+| `text_model` | Anthropic model name (default: `claude-haiku-5-5`; overridden by `ANTHROPIC_MODEL` env var if set) |
 | `voice_model` | Path to Piper TTS voice `.onnx` file (with sibling `.onnx.json`, as written by `python -m piper.download_voices`) |
 | `whisper_model` | Path to whisper.cpp model file (default: `ggml-base.en.bin`) |
 | `whisper_threads` | Number of CPU threads for whisper transcription (default: `3`) |
@@ -182,20 +182,10 @@ Every key is optional; anything you leave out uses its default. Values are check
 | `wake_word_threshold` | Wake-word score needed to trigger, above 0 and at most 1 (default: `0.5`) |
 | `wake_word_consecutive` | Consecutive 80 ms frames that must clear `wake_word_threshold` (default: `1`) |
 | `camera_trigger_words` | Words/phrases that offer the camera tool to Claude on that turn (whole words; case and punctuation ignored). Default includes "look", "see", "picture", "photo", "camera", "what is this". `[]` disables the camera entirely |
-| `temperature` | Sampling temperature, `0.0`–`1.0` (default: `0.7`). `null` leaves it out so the model's default applies |
-| `effort` | Thinking effort: `"low"`, `"medium"` or `"high"` (default: `null`, meaning not sent) |
+| `temperature` | Sampling temperature, `0.0`–`1.0` (default: `null`, which leaves it out so the model's default applies) |
+| `effort` | Thinking effort: `"low"`, `"medium"` or `"high"` (default: `"low"`). `null` means not sent |
 
-### Switching models
-
-The default `claude-haiku-4-5` works with the defaults above. To use Claude Haiku 5.5 instead, set these three keys together:
-
-```json
-"text_model": "claude-haiku-5-5",
-"temperature": null,
-"effort": "low"
-```
-
-The parameters are not interchangeable: Claude 5.x models reject a non-default `temperature`, while `claude-haiku-4-5` rejects `effort`. A mismatch fails at startup with "Can't reach Claude" (see Troubleshooting). `"effort": "low"` keeps spoken replies fast.
+If you change `text_model` (or set `ANTHROPIC_MODEL` in `.env`, which overrides it), the `temperature`/`effort` keys must suit the model you choose; a mismatch fails at startup with "Can't reach Claude" (see Troubleshooting).
 
 ### Privacy & files
 
@@ -222,7 +212,7 @@ This software is a generic framework. You can give it a new personality by repla
 * **`couldn't connect to display ":0"` error:** The Pi must be running a desktop environment (X11 or Wayland). If you installed Raspberry Pi OS Lite (server/headless), you need to install `lightdm` and configure desktop autologin via `sudo raspi-config` — see [Display Requirements](#️-display-requirements). If running over SSH, ensure the desktop is already active on the Pi. You can override the target display with `DISPLAY=:1 python agent.py` if needed.
 * **"AuthenticationError" or API key errors:** Ensure your `.env` file exists and contains a valid `ANTHROPIC_API_KEY`. Copy from `example.env` if needed.
 * **`[CONFIG]` warnings at startup:** Config problems are reported in the console and `agent.log` when the agent starts. A bad value or unknown key is skipped (its default is used); if `config.json` is not valid JSON, the **whole file is ignored** with a loud error banner and every setting is at its default, so fix the syntax and restart.
-* **Startup shows "Can't reach Claude: check API key / network":** The warm-up request failed. Check `ANTHROPIC_API_KEY` in `.env`, the network connection, and that `text_model`/`temperature`/`effort` match (see [Switching models](#switching-models)). The exact API error is in `agent.log`.
+* **Startup shows "Can't reach Claude: check API key / network":** The warm-up request failed. Check `ANTHROPIC_API_KEY` in `.env`, the network connection, and that the `temperature`/`effort` keys suit `text_model`. The exact API error is in `agent.log`.
 * **"No search library found":** If web search fails, ensure you are in the `.venv` virtual environment and `ddgs` is installed (`uv sync`).
 * **Shutdown Errors:** When you exit the script (Ctrl+C), you might see `Expression 'alsa_snd_pcm_mmap_begin' failed`. **This is normal.** It just means the audio stream was cut off mid-sample. It does not affect the functionality.
 * **Audio Glitches:** If the voice sounds fast or slow, the script attempts to auto-detect sample rates. Ensure your `config.json` points to a valid `.onnx` voice model in the `piper/` folder (with its sibling `.onnx.json` next to it). To switch voices, run `uv run python -m piper.download_voices --data-dir piper <voice-name>`.

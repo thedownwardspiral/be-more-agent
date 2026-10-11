@@ -13,7 +13,7 @@ stack with the cloud-based Anthropic API (Claude).
 | Area              | Original (Ollama)                   | Fork (Anthropic API)              |
 | ----------------- | ----------------------------------- | --------------------------------- |
 | LLM library       | `ollama` Python package             | `anthropic` Python SDK            |
-| Text model        | `gemma3:1b` (local)                 | `claude-haiku-4-5` (cloud)        |
+| Text model        | `gemma3:1b` (local)                 | `claude-haiku-5-5` (cloud)        |
 | Vision model      | `moondream` (local, separate model) | Claude native vision (same model) |
 | Streaming         | `ollama.chat(stream=True)`          | `client.messages.stream()`        |
 | Summarization     | `ollama.chat(stream=False)`         | `client.messages.create()`        |
@@ -182,7 +182,7 @@ instead of a prebuilt binary.
 
 | Key                      | Original                          | Fork                                    |
 | ------------------------ | --------------------------------- | --------------------------------------- |
-| `text_model`             | `gemma3:1b`                       | `claude-haiku-4-5`                      |
+| `text_model`             | `gemma3:1b`                       | `claude-haiku-5-5`                      |
 | `vision_model`           | `moondream`                       | Removed (Claude handles vision)         |
 | `voice_model`            | `piper/en_GB-semaine-medium.onnx` | `piper/en_US-bmo-medium.onnx`           |
 | `whisper_model`          | --                                | `./whisper.cpp/models/ggml-base.en.bin` |
@@ -398,9 +398,9 @@ The bundled `sounds/*.wav` clips were deleted earlier (07c0230); the
 - **New keys**: `temperature` (default 0.7; null omits it) and `effort`
   (default null; when set, sent as `output_config={"effort": ...}`),
   shared by chat and warm-up via `LLM_KWARGS` (warm-up `max_tokens` is
-  32). Haiku 5.5 recipe: `"text_model": "claude-haiku-5-5",
-  "temperature": null, "effort": "low"`. Default model unchanged:
-  `claude-haiku-4-5`.
+  32).
+- **Default model**: now Claude Haiku 5.5 (`claude-haiku-5-5`) with
+  `temperature` null and `effort` "low".
 
 ### Code quality
 
