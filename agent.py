@@ -145,6 +145,12 @@ DEFAULT_CONFIG = {
     "whisper_model": "./whisper.cpp/models/ggml-base.en.bin",
     "whisper_threads": 3,
     "audio_energy_threshold": 0.002,
+    # Silero VAD ends a wake-word recording this many seconds after speech
+    # stops (raise it if you get cut off mid-sentence), counting audio as
+    # speech above vad_threshold (0.1-0.9; raise it in a noisy room).
+    "vad_min_silence": 0.6,
+    "vad_threshold": 0.5,
+    # Used only if models/silero_vad.onnx is missing (RMS silence detection)
     "silence_threshold": 0.006,
     # Raise either of these only if you observe genuine false wakes; 0.5/1 is the
     # long-standing openwakeword default. "consecutive" requires N frames in a row
@@ -231,6 +237,8 @@ CONFIG_RANGES = {
     "max_history_messages": (lambda v: v >= 2, "at least 2"),
     "stt_engine": (lambda v: v in ("parakeet", "whisper"), '"parakeet" or "whisper"'),
     "stt_threads": (lambda v: 1 <= v <= 4, "between 1 and 4"),
+    "vad_min_silence": (lambda v: 0.2 <= v <= 3.0, "between 0.2 and 3.0"),
+    "vad_threshold": (lambda v: 0.1 <= v <= 0.9, "between 0.1 and 0.9"),
     "whisper_threads": (lambda v: 1 <= v <= 8, "between 1 and 8"),
     "camera_rotation": (lambda v: v in (0, 90, 180, 270), "one of 0, 90, 180, 270"),
     "audio_energy_threshold": (lambda v: v >= 0, "0 or more"),
@@ -348,6 +356,17 @@ PARAKEET_FILES = {
     "joiner": "joiner.int8.onnx",
     "tokens": "tokens.txt",
 }
+SILERO_VAD_MODEL = BASE_DIR / "models" / "silero_vad.onnx"
+VAD_THRESHOLD = CURRENT_CONFIG["vad_threshold"]
+VAD_MIN_SILENCE = CURRENT_CONFIG["vad_min_silence"]
+# Kept around the VAD's speech segment, in 16 kHz samples: Silero puts the
+# start ~50 ms into the first word, and the end needs no more than a breath
+VAD_PRE_ROLL = int(0.3 * STT_SAMPLE_RATE)
+VAD_POST_ROLL = int(0.2 * STT_SAMPLE_RATE)
+# Wake-word recordings: hard cap, and how long to wait for speech to start
+MAX_RECORD_TIME = 30.0
+LEADING_SILENCE_TIME = 5.0
+RECORD_CHUNK_DURATION = 0.05  # 50 ms input blocks
 
 def resample_to_stt_rate(audio, rate, padtype="constant"):
     """float32 mono audio at `rate` -> float32 at STT_SAMPLE_RATE (polyphase)."""
@@ -719,6 +738,8 @@ class BotGUI:
             self._load_parakeet()
         else:
             log.info("[INIT] Speech-to-text: whisper.cpp (stt_engine is \"whisper\")")
+        # Ends wake-word recordings; None means RMS silence detection
+        self.vad = self._load_vad()
 
         # --- WAKE WORD INITIALIZATION ---
         log.info("[INIT] Loading Wake Word...")
@@ -797,6 +818,30 @@ class BotGUI:
         log.error(f"[STT] ERROR: Parakeet unavailable: {reason}. "
                   "Falling back to whisper.cpp for this run.")
         self.stt_notice = "Parakeet unavailable: using whisper"
+
+    def _load_vad(self):
+        """Silero VAD for record_voice_adaptive, or None (logged) to use RMS silence."""
+        if sherpa_onnx is None:
+            reason = "sherpa-onnx is not importable; run `uv sync`"
+        elif not SILERO_VAD_MODEL.is_file():
+            reason = f"{SILERO_VAD_MODEL.relative_to(BASE_DIR)} is missing; run setup.sh (step 5 downloads it)"
+        else:
+            try:
+                config = sherpa_onnx.VadModelConfig(
+                    silero_vad=sherpa_onnx.SileroVadModelConfig(
+                        model=str(SILERO_VAD_MODEL), threshold=VAD_THRESHOLD,
+                        min_silence_duration=VAD_MIN_SILENCE, min_speech_duration=0.25,
+                        # Past this Silero force-splits a segment; never before our own cap
+                        max_speech_duration=MAX_RECORD_TIME + 1),
+                    sample_rate=STT_SAMPLE_RATE, num_threads=1)
+                vad = sherpa_onnx.VoiceActivityDetector(config, buffer_size_in_seconds=MAX_RECORD_TIME + 10)
+                log.info(f"[INIT] Silero VAD loaded: recordings end {VAD_MIN_SILENCE}s after speech")
+                return vad
+            except Exception as e:
+                reason = f"loading failed: {e}"
+        log.warning(f"[VAD] Silero VAD unavailable: {reason}. "
+                    "Ending recordings on RMS silence (1.5 s tail) instead.")
+        return None
 
     def _lock_tmp_dir(self):
         """(Re)create tmp_dir/.lock and hold an exclusive flock on it."""
@@ -1400,20 +1445,102 @@ class BotGUI:
     def record_voice_adaptive(self):
         """Record until the speaker stops. Returns 16 kHz float32 samples or None."""
         log.info("Recording (Adaptive)...")
-        time.sleep(0.5)
+        # Nothing plays between the trigger and here (no sound on wake), and the
+        # wake-word stream is already closed; the device settle is the 0.2 s
+        # after sd.stop() below. Any longer wait only drops the first words.
+        time.sleep(0.2)
         samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
 
+        try:
+            # Release any prior stream first — hardware contention freezes the Pi 5
+            self._wait_for_thinking_sound()
+            sd.stop()
+            time.sleep(0.2)
+
+            if self.vad is not None:
+                audio = self._record_until_vad_end(samplerate)
+            else:
+                audio = self._record_until_rms_silence(samplerate)
+        except Exception as e:
+            log.error(f"[AUDIO ERROR] Adaptive Recording Failed: {e}")
+            return None
+
+        return self._finish_recording(audio)
+
+    def _record_until_vad_end(self, samplerate):
+        """Endpoint with Silero VAD: stop once vad_min_silence of quiet follows
+        speech, or no speech has started after LEADING_SILENCE_TIME. Returns 16
+        kHz float32 audio around the speech segment, or None if there was none."""
+        chunk_size = int(samplerate * RECORD_CHUNK_DURATION)
+        max_samples = int(MAX_RECORD_TIME * STT_SAMPLE_RATE)
+        leading_samples = int(LEADING_SILENCE_TIME * STT_SAMPLE_RATE)
+        blocks = queue.Queue()
+        raw = []
+
+        def callback(indata, frames, time_info, status):
+            # PortAudio thread: only hand the block over; the VAD runs below
+            blocks.put(indata.copy())
+
+        vad = self.vad
+        vad.reset()
+        fed = 0           # 16 kHz samples given to the VAD so far
+        heard = False
+        ended = False
+        # Bounds the loop even if the stream stops delivering blocks
+        deadline = time.monotonic() + MAX_RECORD_TIME + 5
+        with sd.InputStream(samplerate=samplerate, channels=1, callback=callback,
+                            device=INPUT_DEVICE_NAME, blocksize=chunk_size):
+            while time.monotonic() < deadline:
+                try:
+                    block = blocks.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                raw.append(block)
+                block = np.clip(np.nan_to_num(block.ravel(), nan=0.0, posinf=0.0, neginf=0.0), -1.0, 1.0)
+                # Per-block resample just for the VAD ("line" padding keeps the
+                # block edges smooth); the utterance itself is resampled whole below
+                samples = resample_to_stt_rate(block, samplerate, padtype="line")
+                vad.accept_waveform(samples)
+                fed += len(samples)
+                if not vad.empty():
+                    ended = True  # a complete segment: speech, then the silence tail
+                    break
+                if not heard and vad.is_speech_detected():
+                    heard = True
+                    log.info(f"[VAD] Speech started ({fed / STT_SAMPLE_RATE:.2f}s)")
+                if fed >= max_samples or (not heard and fed >= leading_samples):
+                    break
+
+        if not ended:
+            vad.flush()  # finalize speech that ran into the time limit
+        if vad.empty():
+            log.info(f"[VAD] No speech in {fed / STT_SAMPLE_RATE:.1f}s")
+            return None
+        segment = vad.front
+        start = segment.start
+        end = segment.start + len(segment.samples)
+        log.info(f"[VAD] Speech {start / STT_SAMPLE_RATE:.2f}-{end / STT_SAMPLE_RATE:.2f}s, "
+                 f"stopped at {fed / STT_SAMPLE_RATE:.2f}s")
+        audio = self._buffer_to_stt_rate(raw, samplerate)
+        if audio is None:
+            return None
+        # Silero places the start a little into the first word; widen the cut
+        # from the full recording rather than using segment.samples as-is
+        return audio[max(0, start - VAD_PRE_ROLL):end + VAD_POST_ROLL]
+
+    def _record_until_rms_silence(self, samplerate):
+        """Fallback endpointing when the VAD model is missing: stop 1.5 s after
+        the volume drops to the ambient noise floor. Returns 16 kHz float32 or None."""
         silence_threshold = CURRENT_CONFIG["silence_threshold"]
         silence_duration = 1.5
-        max_record_time = 30.0
         buffer = []
         silent_chunks = 0
-        chunk_duration = 0.05
+        chunk_duration = RECORD_CHUNK_DURATION
         chunk_size = int(samplerate * chunk_duration)
 
         num_silent_chunks = int(silence_duration / chunk_duration)
-        num_leading_silence_chunks = int(5.0 / chunk_duration)
-        max_chunks = int(max_record_time / chunk_duration)
+        num_leading_silence_chunks = int(LEADING_SILENCE_TIME / chunk_duration)
+        max_chunks = int(MAX_RECORD_TIME / chunk_duration)
         recorded_chunks = 0
         silence_started = False
         had_speech = False
@@ -1429,7 +1556,7 @@ class BotGUI:
             recent_volumes.append(volume_norm)
             if recorded_chunks < 5: return
             # Room noise often sits above the static threshold, which used to
-            # force every recording to run the full max_record_time. Track the
+            # force every recording to run the full MAX_RECORD_TIME. Track the
             # ambient floor (20th percentile) and compare a smoothed volume
             # against it, capped so loud early speech can't inflate the bar.
             noise_floor = np.percentile(volume_history, 20)
@@ -1445,26 +1572,18 @@ class BotGUI:
                 had_speech = True
                 silent_chunks = 0
 
-        try:
-            # Release any prior stream first — hardware contention freezes the Pi 5
-            self._wait_for_thinking_sound()
-            sd.stop()
-            time.sleep(0.2)
+        with sd.InputStream(samplerate=samplerate, channels=1, callback=callback,
+                            device=INPUT_DEVICE_NAME, blocksize=chunk_size):
+            while not silence_started and recorded_chunks < max_chunks:
+                sd.sleep(int(chunk_duration * 1000))
 
-            with sd.InputStream(samplerate=samplerate, channels=1, callback=callback,
-                                device=INPUT_DEVICE_NAME, blocksize=chunk_size):
-                while not silence_started and recorded_chunks < max_chunks:
-                    sd.sleep(int(chunk_duration * 1000))
-        except Exception as e:
-            log.error(f"[AUDIO ERROR] Adaptive Recording Failed: {e}")
-            return None
-
-        return self._finish_recording(self._buffer_to_stt_rate(buffer, samplerate))
+        return self._buffer_to_stt_rate(buffer, samplerate)
 
     def record_voice_ptt(self):
         """Record until Enter is pressed again. Returns 16 kHz float32 samples or None."""
         log.info("Recording (PTT)...")
-        time.sleep(0.5)
+        # As in record_voice_adaptive: the settle is the 0.2 s after sd.stop()
+        time.sleep(0.2)
         samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
 
         buffer = []
