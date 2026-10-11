@@ -17,7 +17,7 @@ os.environ.setdefault("DISPLAY", ":0")
 from pathlib import Path
 
 # Every relative path in this file (config.json, .env, memory.json, faces/,
-# sounds/, piper/, wakeword.onnx, and the whisper.cpp paths in config.json) is
+# sounds/, piper/, models/, wakeword.onnx, and the whisper.cpp paths in config.json) is
 # relative to the repo root. Anchor the process there so the agent works no
 # matter which directory it was launched from (SSH, systemd, autostart).
 BASE_DIR = Path(__file__).resolve().parent
@@ -71,6 +71,7 @@ from PIL import Image, ImageTk
 import threading
 import time
 import json
+import math
 import subprocess
 import random
 import re
@@ -100,6 +101,15 @@ from openwakeword.model import Model
 import anthropic
 from piper import PiperVoice
 from dotenv import load_dotenv
+# Speech-to-text (Parakeet) and voice activity detection (Silero) run in-process
+# through sherpa-onnx. Guarded so a .venv that predates it (start_agent.sh runs
+# .venv/bin/python directly, without `uv sync`) still starts, on whisper.cpp.
+try:
+    import sherpa_onnx
+    SHERPA_IMPORT_ERROR = None
+except ImportError as e:
+    sherpa_onnx = None
+    SHERPA_IMPORT_ERROR = e
 import base64
 
 # Load environment variables from the repo's .env file
@@ -125,6 +135,13 @@ DEFAULT_CONFIG = {
     # Claude Haiku 5.5, paired with temperature null and effort "low" below.
     "text_model": "claude-haiku-5-5",
     "voice_model": "piper/en_US-bmo-medium.onnx",
+    # Speech-to-text engine: "parakeet" (NVIDIA Parakeet-TDT 0.6B v2, in-process
+    # via sherpa-onnx; models/ is filled by setup.sh step 5) or "whisper" (the
+    # whisper.cpp fallback below). A missing Parakeet model falls back to whisper.
+    "stt_engine": "parakeet",
+    # CPU threads for Parakeet. 2 is fastest on a Pi 5; 3 or 4 are no faster.
+    "stt_threads": 2,
+    # Used only when stt_engine is "whisper" (or Parakeet could not load)
     "whisper_model": "./whisper.cpp/models/ggml-base.en.bin",
     "whisper_threads": 3,
     "audio_energy_threshold": 0.002,
@@ -212,6 +229,8 @@ CONFIG_RANGES = {
     "wake_word_threshold": (lambda v: 0 < v <= 1, "greater than 0 and at most 1"),
     "wake_word_consecutive": (lambda v: v >= 1, "at least 1"),
     "max_history_messages": (lambda v: v >= 2, "at least 2"),
+    "stt_engine": (lambda v: v in ("parakeet", "whisper"), '"parakeet" or "whisper"'),
+    "stt_threads": (lambda v: 1 <= v <= 4, "between 1 and 4"),
     "whisper_threads": (lambda v: 1 <= v <= 8, "between 1 and 8"),
     "camera_rotation": (lambda v: v in (0, 90, 180, 270), "one of 0, 90, 180, 270"),
     "audio_energy_threshold": (lambda v: v >= 0, "0 or more"),
@@ -317,6 +336,27 @@ WAKE_WORD_CONSECUTIVE = CURRENT_CONFIG["wake_word_consecutive"]
 MAX_HISTORY_MESSAGES = CURRENT_CONFIG["max_history_messages"]
 CHAT_MEMORY_ENABLED = CURRENT_CONFIG["chat_memory"]
 LOG_TRANSCRIPTS = CURRENT_CONFIG["log_transcripts"]
+STT_ENGINE = CURRENT_CONFIG["stt_engine"]
+STT_THREADS = CURRENT_CONFIG["stt_threads"]
+
+# Both STT engines take 16 kHz mono; recordings are converted to this rate.
+STT_SAMPLE_RATE = 16000
+PARAKEET_MODEL_DIR = BASE_DIR / "models" / "parakeet-tdt-0.6b-v2-int8"
+PARAKEET_FILES = {
+    "encoder": "encoder.int8.onnx",
+    "decoder": "decoder.int8.onnx",
+    "joiner": "joiner.int8.onnx",
+    "tokens": "tokens.txt",
+}
+
+def resample_to_stt_rate(audio, rate, padtype="constant"):
+    """float32 mono audio at `rate` -> float32 at STT_SAMPLE_RATE (polyphase)."""
+    rate = int(rate)
+    if rate == STT_SAMPLE_RATE:
+        return np.asarray(audio, dtype=np.float32)
+    g = math.gcd(rate, STT_SAMPLE_RATE)
+    return scipy.signal.resample_poly(audio, STT_SAMPLE_RATE // g, rate // g,
+                                      padtype=padtype).astype(np.float32)
 
 def log_transcript(prefix, text):
     """Log a line carrying the user's or the bot's words, honouring log_transcripts."""
@@ -669,6 +709,17 @@ class BotGUI:
         except Exception as e:
             log.error(f"[CRITICAL] Failed to load Piper voice '{voice_model}': {e}")
 
+        # --- SPEECH-TO-TEXT INITIALIZATION ---
+        # None means whisper.cpp transcribes (configured, or the fallback)
+        self.recognizer = None
+        # Shown in the IDLE status for the whole run when Parakeet was wanted
+        # but could not load, so the slower fallback is not silent
+        self.stt_notice = None
+        if STT_ENGINE == "parakeet":
+            self._load_parakeet()
+        else:
+            log.info("[INIT] Speech-to-text: whisper.cpp (stt_engine is \"whisper\")")
+
         # --- WAKE WORD INITIALIZATION ---
         log.info("[INIT] Loading Wake Word...")
         self.oww_model = None
@@ -722,6 +773,30 @@ class BotGUI:
         threading.Thread(target=self.safe_main_execution, daemon=True).start()
 
     # --- HELPERS ---
+
+    def _load_parakeet(self):
+        """Load Parakeet into self.recognizer, or log why not and leave whisper on."""
+        paths = {k: PARAKEET_MODEL_DIR / f for k, f in PARAKEET_FILES.items()}
+        missing = [p for p in paths.values() if not p.is_file()]
+        if sherpa_onnx is None:
+            reason = f"sherpa-onnx is not importable ({SHERPA_IMPORT_ERROR}); run `uv sync`"
+        elif missing:
+            reason = (f"model file {missing[0].relative_to(BASE_DIR)} is missing; "
+                      "run setup.sh (step 5 downloads it)")
+        else:
+            log.info(f"[INIT] Loading Parakeet speech-to-text ({STT_THREADS} threads, ~1 GB RAM)...")
+            t0 = time.monotonic()
+            try:
+                self.recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
+                    **{k: str(p) for k, p in paths.items()},
+                    model_type="nemo_transducer", num_threads=STT_THREADS)
+                log.info(f"[INIT] Parakeet loaded in {time.monotonic() - t0:.1f}s")
+                return
+            except Exception as e:
+                reason = f"loading failed: {e}"
+        log.error(f"[STT] ERROR: Parakeet unavailable: {reason}. "
+                  "Falling back to whisper.cpp for this run.")
+        self.stt_notice = "Parakeet unavailable: using whisper"
 
     def _lock_tmp_dir(self):
         """(Re)create tmp_dir/.lock and hold an exclusive flock on it."""
@@ -1128,21 +1203,17 @@ class BotGUI:
 
                     self.set_state(BotStates.LISTENING, "I'm listening!")
                 
-                    audio_file = None
+                    # 16 kHz float32 mono samples, or None
                     if trigger_source == "PTT":
-                        audio_file = self.record_voice_ptt()
+                        audio = self.record_voice_ptt()
                     else:
-                        audio_file = self.record_voice_adaptive()
-                
-                    if not audio_file: 
+                        audio = self.record_voice_adaptive()
+
+                    if audio is None:
                         self.set_state(BotStates.IDLE, "Heard nothing.")
                         continue
-                
-                    try:
-                        user_text = self.transcribe_audio(audio_file)
-                    finally:
-                        # The recording is only needed for whisper; don't leave it on disk
-                        self._remove_file(audio_file)
+
+                    user_text = self.transcribe_audio(audio)
                     if not user_text:
                         self.set_state(BotStates.IDLE, "Transcription empty.")
                         continue
@@ -1192,8 +1263,10 @@ class BotGUI:
         log.info("Ready.")
 
     def detect_wake_word_or_ptt(self):
-        # Keep a failed warm-up visible until a turn succeeds
-        status = f"Waiting... ({self.startup_error})" if self.startup_error else "Waiting..."
+        # Keep a failed warm-up visible until a turn succeeds, and an STT
+        # fallback for the whole run
+        notes = [n for n in (self.startup_error, self.stt_notice) if n]
+        status = f"Waiting... ({'; '.join(notes)})" if notes else "Waiting..."
         self.set_state(BotStates.IDLE, status)
         # From here Enter may toggle PTT on (handle_ptt_toggle); the caller
         # clears this once a trigger is returned. Set after IDLE, so the two
@@ -1324,7 +1397,8 @@ class BotGUI:
             if t.is_alive():
                 log.warning("[AUDIO] Thinking sound still playing; recording anyway")
 
-    def record_voice_adaptive(self, filename=None):
+    def record_voice_adaptive(self):
+        """Record until the speaker stops. Returns 16 kHz float32 samples or None."""
         log.info("Recording (Adaptive)...")
         time.sleep(0.5)
         samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
@@ -1385,9 +1459,10 @@ class BotGUI:
             log.error(f"[AUDIO ERROR] Adaptive Recording Failed: {e}")
             return None
 
-        return self.save_audio_buffer(buffer, filename, samplerate)
+        return self._finish_recording(self._buffer_to_stt_rate(buffer, samplerate))
 
-    def record_voice_ptt(self, filename=None):
+    def record_voice_ptt(self):
+        """Record until Enter is pressed again. Returns 16 kHz float32 samples or None."""
         log.info("Recording (PTT)...")
         time.sleep(0.5)
         samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
@@ -1409,46 +1484,56 @@ class BotGUI:
             self.recording_active.clear()
             return None
 
-        return self.save_audio_buffer(buffer, filename, samplerate)
+        return self._finish_recording(self._buffer_to_stt_rate(buffer, samplerate))
 
-    def save_audio_buffer(self, buffer, filename, samplerate=16000):
-        if not buffer: return None
-        audio_data = np.concatenate(buffer, axis=0).flatten()
-        audio_data = np.nan_to_num(audio_data, nan=0.0, posinf=0.0, neginf=0.0)
-        # Clip first: samples beyond +/-1.0 would wrap around in int16
-        audio_data = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16)
+    def _buffer_to_stt_rate(self, buffer, samplerate):
+        """InputStream callback blocks -> one clean 16 kHz float32 array, or None."""
+        if not buffer:
+            return None
+        audio = np.concatenate(buffer, axis=0).flatten()
+        audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+        return resample_to_stt_rate(np.clip(audio, -1.0, 1.0), samplerate)
+
+    def _finish_recording(self, audio):
+        """Acknowledge a usable recording with the ack sound; pass it through."""
+        if audio is None or not len(audio):
+            return None
+        self.play_sound(self.get_random_sound(ack_sounds_dir))
+        return audio
+
+    def _write_wav(self, audio):
+        """16 kHz float32 samples -> tmp_dir/input.wav for whisper-cli. Path or None."""
+        filename = None
         try:
             self._ensure_tmp_dir()
             # Resolved after _ensure_tmp_dir, which may have moved tmp_dir
-            filename = filename or os.path.join(self.tmp_dir, "input.wav")
+            filename = os.path.join(self.tmp_dir, "input.wav")
+            # Clip first: samples beyond +/-1.0 would wrap around in int16
+            pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
             with wave.open(filename, "wb") as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
-                wf.setframerate(samplerate)
-                wf.writeframes(audio_data.tobytes())
+                wf.setframerate(STT_SAMPLE_RATE)
+                wf.writeframes(pcm.tobytes())
         except OSError as e:
             log.error(f"[AUDIO ERROR] Could not save recording: {e}")
             if filename:
                 self._remove_file(filename)
             return None
-        self.play_sound(self.get_random_sound(ack_sounds_dir))
         return filename
 
-    def _check_audio_energy(self, filename):
+    def _check_audio_energy(self, audio):
         """Return True if audio has enough energy to be worth transcribing."""
         threshold = CURRENT_CONFIG["audio_energy_threshold"]
         try:
-            with wave.open(filename, 'rb') as wf:
-                data = wf.readframes(wf.getnframes())
-            audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-            rms = np.sqrt(np.mean(audio ** 2))
+            rms = float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))))
             log.info(f"[AUDIO] RMS energy: {rms:.6f} (threshold: {threshold})")
             return rms >= threshold
         except Exception as e:
             log.warning(f"[AUDIO] Energy check failed: {e}")
             return True  # transcribe on error to be safe
 
-    def _is_speech(self, transcription):
+    def _is_speech(self, transcription, engine):
         """False for whisper's non-speech annotations and silence hallucinations.
 
         A false wake word fire on room noise used to reach the LLM as "(wind
@@ -1464,19 +1549,53 @@ class BotGUI:
             log.info("[AUDIO] Non-speech audio — ignoring.")
             return False
 
-        if normalize_words(residue) in WHISPER_HALLUCINATIONS:
+        # The list is whisper's failure modes. Parakeet doesn't invent text on
+        # silence, so a real "thank you" or "okay" to it must get through.
+        if engine == "whisper" and normalize_words(residue) in WHISPER_HALLUCINATIONS:
             # The text itself was already logged (or redacted) as "Heard:"
             log.info("[AUDIO] Silence hallucination — ignoring.")
             return False
 
         return True
 
-    def transcribe_audio(self, filename):
-        if not self._check_audio_energy(filename):
+    def transcribe_audio(self, audio):
+        """16 kHz float32 samples -> the user's words, or "" for nothing usable."""
+        if not self._check_audio_energy(audio):
             log.info("[AUDIO] Skipping transcription — audio too quiet.")
             return ""
 
         log.info("Transcribing...")
+        engine = "parakeet" if self.recognizer is not None else "whisper"
+        t0 = time.monotonic()
+        if engine == "parakeet":
+            transcription = self._transcribe_parakeet(audio)
+        else:
+            transcription = self._transcribe_whisper(audio)
+        log.info(f"[STT] {engine} {time.monotonic() - t0:.2f}s "
+                 f"({len(audio) / STT_SAMPLE_RATE:.1f}s of audio)")
+        if transcription is None:
+            return ""  # the engine failed; already logged
+        log_transcript("Heard:", transcription)
+        if not self._is_speech(transcription, engine):
+            return ""
+        return transcription.strip()
+
+    def _transcribe_parakeet(self, audio):
+        """Decode in-process on this (main-loop) thread: ~0.2-1.2 s on a Pi 5."""
+        try:
+            stream = self.recognizer.create_stream()
+            stream.accept_waveform(STT_SAMPLE_RATE, audio)
+            self.recognizer.decode_stream(stream)
+            return stream.result.text.strip()
+        except Exception as e:
+            log.error(f"Transcription Error: Parakeet failed: {e}")
+            return None
+
+    def _transcribe_whisper(self, audio):
+        """Run whisper-cli on a temp WAV. Returns the text, or None on failure."""
+        filename = self._write_wav(audio)
+        if filename is None:
+            return None
         whisper_model = CURRENT_CONFIG["whisper_model"]
         whisper_threads = str(CURRENT_CONFIG["whisper_threads"])
         try:
@@ -1486,20 +1605,19 @@ class BotGUI:
             )
             if result.returncode != 0:
                 log.error(f"Transcription Error: whisper-cli exited {result.returncode}: {result.stderr.strip()[-300:]}")
-                return ""
+                return None
             # whisper-cli prints one timestamped line per segment; join them all
             segments = [WHISPER_TIMESTAMP_RE.sub("", line).strip() for line in result.stdout.split('\n')]
-            transcription = " ".join(seg for seg in segments if seg)
-            log_transcript("Heard:", transcription)
-            if not self._is_speech(transcription):
-                return ""
-            return transcription.strip()
+            return " ".join(seg for seg in segments if seg)
         except subprocess.TimeoutExpired:
             log.error("Transcription Error: whisper-cli timed out after 90s")
-            return ""
+            return None
         except Exception as e:
             log.error(f"Transcription Error: {e}")
-            return ""
+            return None
+        finally:
+            # The WAV exists only for whisper-cli; don't leave the recording on disk
+            self._remove_file(filename)
 
     def capture_image(self):
         self.set_state(BotStates.CAPTURING, "Watching...")
