@@ -87,6 +87,7 @@ import socket
 import stat
 import shutil
 import tempfile
+import traceback
 import fcntl
 
 # Suppress harmless library warnings
@@ -1183,12 +1184,15 @@ class BotGUI:
             self.set_state(BotStates.IDLE, "Interrupted.")
 
     def _cancel_active_stream(self):
-        """Shut down and close the response stream the main loop is reading,
-        so a reader blocked waiting for the next chunk wakes at once (with an
-        httpx.ReadError, which chat_and_respond treats as the interrupt).
-        close() alone isn't enough: on Linux, closing a socket fd does not wake
-        a thread blocked in poll/recv on it, so a stalled stream would sit
-        until the 60s read timeout. shutdown() does wake it."""
+        """Shut down the socket of the response stream the main loop is
+        reading, so a reader blocked waiting for the next chunk wakes at once
+        (with an httpx.RemoteProtocolError or ReadError, which chat_and_respond
+        treats as the interrupt). The main loop's own `with stream:` then
+        closes the connection; closing it here, from the Tk thread, could race
+        the reader's fd (it could be reused before the reader's recv). close()
+        also wouldn't help: on Linux, closing a socket fd does not wake a
+        thread blocked in poll/recv on it, so a stalled stream would sit until
+        the 60s read timeout. shutdown() does wake it."""
         s = self.active_stream
         if s is None:
             return
@@ -1196,13 +1200,15 @@ class BotGUI:
         try:
             sock = s.response.extensions["network_stream"].get_extra_info("socket")
         except Exception as e:
-            # Some transports don't expose the socket; close() still runs
             log.debug(f"[LLM] No socket to shut down on interrupt: {e!r}")
         if sock is not None:
             try:
                 sock.shutdown(socket.SHUT_RDWR)
+                return
             except Exception as e:
                 log.debug(f"[LLM] Shutting the socket down on interrupt failed: {e!r}")
+        # No socket to shut down: close() is the best available, though it
+        # won't wake a reader already blocked on the socket
         try:
             s.close()
         except Exception as e:
@@ -2105,12 +2111,16 @@ class BotGUI:
             with lock:
                 if "stream" in box:
                     return box["stream"]  # the caller handles a late interrupt
-                if "error" in box:
-                    raise box["error"]
+                # Before the error check: a request failure that coincides
+                # with a spacebar press is shown as the interrupt
                 if self.interrupted.is_set():
                     box["abandoned"] = True
+                    if "error" in box:
+                        log.debug(f"[LLM] Request failed during an interrupt: {_err_summary(box['error'])}")
                     log.info("[LLM] Request cancelled by interrupt before the response started")
                     return None
+                if "error" in box:
+                    raise box["error"]
 
     def chat_and_respond(self, text):
         # Drain any stale items from a previous response
@@ -2188,7 +2198,10 @@ class BotGUI:
                 )
                 if stream is None:
                     break  # interrupted before the response started
-                # Published for handle_speaking_interrupt, which closes it to
+                # The response headers arrived, so the API is reachable; set
+                # now so an interrupted reply still clears a stale startup_error
+                api_answered = True
+                # Published for handle_speaking_interrupt, which shuts it down to
                 # wake the read below; then re-check, in case the interrupt
                 # landed before the stream was published
                 self.active_stream = stream
@@ -2232,16 +2245,20 @@ class BotGUI:
                             if not self.interrupted.is_set():
                                 final_message = stream.get_final_message()
                 except Exception as e:
-                    # Closing the stream under a blocked read raises (an
-                    # httpx.ReadError); that is the interrupt, not a failure
+                    # Shutting the socket down under a blocked read raises (an
+                    # httpx.RemoteProtocolError or ReadError); that is the
+                    # interrupt, not a failure. Any exception while interrupted
+                    # is classified this way, so log it in full at debug in
+                    # case it was a real bug in the UI/TTS code above.
                     if not self.interrupted.is_set():
                         raise
+                    tb = traceback.extract_tb(e.__traceback__)
+                    where = f" at {os.path.basename(tb[-1].filename)}:{tb[-1].lineno}" if tb else ""
+                    log.debug(f"[LLM] Exception during interrupted stream{where}: {_err_summary(e)}")
                     log.info(f"[LLM] Response stream closed by interrupt ({type(e).__name__})")
                 finally:
                     self.active_stream = None
 
-                if final_message is not None:
-                    api_answered = True
                 if self.interrupted.is_set() or final_message is None:
                     break
 

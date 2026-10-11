@@ -536,11 +536,19 @@ up to 20 s for `rpicam-still`. Each span now checks every `INTERRUPT_POLL`
   opens later is closed by the helper). Closing the client does not stop a
   request still waiting for headers (tested), so a thread is needed here.
 - **API stream, while reading**: the open stream is kept in `active_stream`;
-  `handle_speaking_interrupt` shuts its socket down and closes it from the Tk
-  thread, so a blocked read wakes immediately and raises `httpx.ReadError`,
-  which the stream block treats as the interrupt instead of an error. The
-  shutdown matters: on Linux, closing the fd alone does not wake a thread
-  blocked on it, so a stalled stream would wait out the 60 s read timeout.
+  `handle_speaking_interrupt` shuts its socket down (`SHUT_RDWR`) from the Tk
+  thread, and nothing more: the main loop's own `with stream:` closes the
+  connection, avoiding a cross-thread close racing the reader's fd. A blocked
+  read wakes immediately (0.3 ms against a stalled test server) and raises
+  `httpx.RemoteProtocolError` (incomplete chunked read) or `httpx.ReadError`.
+  Any exception raised while `interrupted` is set is classified as the
+  interrupt, not an error, and logged at debug with its type and raising line.
+  The shutdown matters: on Linux, closing the fd alone does not wake a thread
+  blocked on it, so a stalled stream would wait out the 60 s read timeout;
+  `close()` is only the fallback when no socket is exposed. A request error
+  that coincides with an interrupt in `_open_stream()` also shows as the
+  interrupt, and the API counts as answered (clearing a stale startup error)
+  once the response headers arrive.
   `_open_stream()` doesn't send at all if `interrupted` is already set (the
   helper re-checks just before sending), and an abandoned helper's request
   error is logged at debug.
