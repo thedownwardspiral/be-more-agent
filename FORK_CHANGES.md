@@ -562,3 +562,23 @@ up to 20 s for `rpicam-still`. Each span now checks every `INTERRUPT_POLL`
 An interrupted tool returns `("interrupted", True)`, which is never sent to
 Claude; the turn ends through the usual path (no memory save, TTS drained,
 "Ready").
+
+## Push-to-talk Cap and Chunked Parakeet Decoding
+
+- **PTT cap**: a push-to-talk recording stops at `MAX_PTT_RECORD_TIME`
+  (60 s) if Enter is never pressed again. It logs
+  `[PTT] Max recording length reached (60 s)`, clears `recording_active`
+  (the next Enter starts a new recording), shows "That's all I can hold!"
+  and transcribes what was recorded. Before, a forgotten PTT session grew
+  without limit, and one Parakeet decode of minutes of audio froze the bot
+  (Pi 5: 90 s took 20.5 s and +830 MB, 180 s took 58.5 s and +1.7 GB, on
+  top of the ~1 GB model; spacebar cannot interrupt a decode).
+- **Chunked decoding**: Parakeet decodes audio longer than 25 s
+  (`STT_CHUNK_SECONDS`) in chunks of at most 25 s, cut at the quietest
+  200 ms window within ±3 s of each target, so cuts land in pauses rather
+  than mid-word. Each chunk uses a fresh stream; the texts are joined with a
+  space; each chunk and the total are logged. A 55.7 s test recording (five
+  questions repeated, 1.5 s gaps) split at 22.10 s and 43.84 s, both in
+  gaps, and decoded in 7.6 s with +150 MB peak RSS, versus 10.0 s and
+  +383 MB in one call, with the same words. Audio up to 25 s is decoded in
+  one call as before; the whisper fallback is unchanged.

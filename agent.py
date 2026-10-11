@@ -386,6 +386,56 @@ LEADING_SILENCE_TIME = 5.0
 # confirmed at the cutoff; this grace keeps it from being dropped.
 LEADING_SILENCE_GRACE = 0.5
 RECORD_CHUNK_DURATION = 0.05  # 50 ms input blocks
+# Push-to-talk recordings stop here even if Enter is never pressed again.
+# Parakeet's single-call decode cost grows super-linearly (Pi 5: 30 s of audio
+# 4.8 s, 90 s 20.5 s / +830 MB, 180 s 58.5 s / +1.7 GB) and can't be interrupted.
+MAX_PTT_RECORD_TIME = 60.0
+# Longer audio is decoded by Parakeet in chunks of at most this many seconds,
+# split at the quietest STT_SPLIT_WINDOW within STT_SPLIT_SEARCH seconds of
+# each target (the target sits STT_SPLIT_SEARCH before the cap, so no chunk
+# ever exceeds it)
+STT_CHUNK_SECONDS = 25.0
+STT_SPLIT_SEARCH = 3.0
+STT_SPLIT_WINDOW = 0.2
+STT_SPLIT_FRAME = 0.02
+
+def stt_split_points(audio, rate=STT_SAMPLE_RATE):
+    """Sample indices at which to cut `audio` into chunks of at most
+    STT_CHUNK_SECONDS. Each cut is the centre of the lowest-energy
+    STT_SPLIT_WINDOW (RMS over STT_SPLIT_FRAME frames) within STT_SPLIT_SEARCH
+    seconds of its target, so it lands in a pause rather than mid-word.
+    Returns [] when the audio fits in one chunk."""
+    n = len(audio)
+    max_len = int(STT_CHUNK_SECONDS * rate)
+    if n <= max_len:
+        return []
+    frame = int(STT_SPLIT_FRAME * rate)
+    n_frames = n // frame
+    energy = np.mean(np.square(audio[:n_frames * frame].astype(np.float64)).reshape(n_frames, frame), axis=1)
+    win = max(1, int(round(STT_SPLIT_WINDOW / STT_SPLIT_FRAME)))
+    # Mean energy of the window starting at each frame
+    csum = np.concatenate(([0.0], np.cumsum(energy)))
+    win_energy = (csum[win:] - csum[:-win]) / win
+    search = int(STT_SPLIT_SEARCH / STT_SPLIT_FRAME)
+    cap = int(STT_CHUNK_SECONDS / STT_SPLIT_FRAME)
+    points = []
+    prev = 0  # in frames
+    while n - prev * frame > max_len:
+        target = prev + cap - search
+        # Window must end by prev + cap, so the chunk stays within the cap
+        lo = max(prev + 1, target - search)
+        hi = min(len(win_energy) - 1, prev + cap - win, target + search)
+        if hi < lo:
+            cut = prev + cap - win // 2
+        else:
+            cand = win_energy[lo:hi + 1]
+            # Quietest window; among (near-)equal ones the one nearest the target
+            quiet = np.flatnonzero(cand <= cand.min() * 1.05 + 1e-12) + lo
+            start = int(quiet[np.argmin(np.abs(quiet - target))])
+            cut = start + win // 2
+        points.append(cut * frame)
+        prev = cut
+    return points
 
 def resample_to_stt_rate(audio, rate, padtype="constant"):
     """float32 mono audio at `rate` -> float32 at STT_SAMPLE_RATE (polyphase)."""
@@ -1828,14 +1878,20 @@ class BotGUI:
         return self._buffer_to_stt_rate(buffer, samplerate)
 
     def record_voice_ptt(self):
-        """Record until Enter is pressed again. Returns 16 kHz float32 samples or None."""
+        """Record until Enter is pressed again, or MAX_PTT_RECORD_TIME. Returns 16 kHz
+        float32 samples or None."""
         log.info("Recording (PTT)...")
         # As in record_voice_adaptive: the settle is the 0.2 s after sd.stop()
         time.sleep(0.2)
         samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
 
         buffer = []
-        def callback(indata, frames, time_info, status): buffer.append(indata.copy())
+        recorded = 0
+        max_frames = int(MAX_PTT_RECORD_TIME * samplerate)
+        def callback(indata, frames, time_info, status):
+            nonlocal recorded
+            buffer.append(indata.copy())
+            recorded += frames
 
         try:
             # Release any prior stream first — hardware contention freezes the Pi 5
@@ -1844,14 +1900,28 @@ class BotGUI:
             time.sleep(0.2)
 
             with sd.InputStream(samplerate=samplerate, channels=1, callback=callback, device=INPUT_DEVICE_NAME):
-                while self.recording_active.is_set(): sd.sleep(50)
+                while self.recording_active.is_set() and recorded < max_frames:
+                    sd.sleep(50)
         except Exception as e:
             log.error(f"[AUDIO ERROR] PTT Recording Failed: {e}")
             # End the PTT session, or detect_wake_word_or_ptt would retry at once
             self.recording_active.clear()
             return None
 
-        return self._finish_recording(self._buffer_to_stt_rate(buffer, samplerate))
+        if recorded >= max_frames:
+            with self.ptt_lock:
+                capped = self.recording_active.is_set()
+                # As if toggled off: the next Enter starts a new recording
+                self.recording_active.clear()
+            if capped:
+                log.info(f"[PTT] Max recording length reached ({MAX_PTT_RECORD_TIME:.0f} s)")
+                self.set_state(BotStates.LISTENING, "That's all I can hold!")
+
+        audio = self._buffer_to_stt_rate(buffer, samplerate)
+        if audio is not None:
+            # Blocks that arrived while the stream was closing
+            audio = audio[:int(MAX_PTT_RECORD_TIME * STT_SAMPLE_RATE)]
+        return self._finish_recording(audio)
 
     def _buffer_to_stt_rate(self, buffer, samplerate):
         """InputStream callback blocks -> one clean 16 kHz float32 array, or None."""
@@ -1953,15 +2023,40 @@ class BotGUI:
         return transcription.strip()
 
     def _transcribe_parakeet(self, audio):
-        """Decode in-process on this (main-loop) thread: ~0.2-1.2 s on a Pi 5."""
+        """Decode in-process on this (main-loop) thread: ~0.2-1.2 s on a Pi 5.
+
+        Audio longer than STT_CHUNK_SECONDS is split at quiet points and decoded
+        chunk by chunk: one call's time and memory grow super-linearly with
+        length, while 25 s chunks keep both roughly linear."""
         try:
-            stream = self.recognizer.create_stream()
-            stream.accept_waveform(STT_SAMPLE_RATE, audio)
-            self.recognizer.decode_stream(stream)
-            return stream.result.text.strip()
+            points = stt_split_points(audio)
+            if not points:
+                return self._decode_parakeet_chunk(audio)
+            bounds = [0] + points + [len(audio)]
+            texts = []
+            t_total = time.monotonic()
+            for i in range(len(bounds) - 1):
+                chunk = audio[bounds[i]:bounds[i + 1]]
+                t0 = time.monotonic()
+                text = self._decode_parakeet_chunk(chunk)
+                log.info(f"[STT] parakeet chunk {i + 1}/{len(bounds) - 1}: "
+                         f"{time.monotonic() - t0:.2f}s ({len(chunk) / STT_SAMPLE_RATE:.1f}s of audio, "
+                         f"from {bounds[i] / STT_SAMPLE_RATE:.2f}s)")
+                if text:
+                    texts.append(text)
+            log.info(f"[STT] parakeet {len(bounds) - 1} chunks, {time.monotonic() - t_total:.1f}s total "
+                     f"({len(audio) / STT_SAMPLE_RATE:.1f}s of audio)")
+            return " ".join(texts)
         except Exception as e:
             log.error(f"Transcription Error: Parakeet failed: {e}")
             return None
+
+    def _decode_parakeet_chunk(self, audio):
+        """One Parakeet decode on a fresh stream; the stripped text."""
+        stream = self.recognizer.create_stream()
+        stream.accept_waveform(STT_SAMPLE_RATE, audio)
+        self.recognizer.decode_stream(stream)
+        return stream.result.text.strip()
 
     def _transcribe_whisper(self, audio):
         """Run whisper-cli on a temp WAV. Returns the text, or None on failure."""
