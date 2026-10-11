@@ -210,26 +210,65 @@ TTS_ABBREVIATION_RE = re.compile(
 )
 # The "[tools used: ...]" note _history_messages() appends to earlier replies.
 # Claude may imitate it in a new reply, where it would be spoken, shown and
-# saved as if it were a real tool trace; ToolNoteFilter removes it.
-TOOL_NOTE_RE = re.compile(r"\s*\[tools used:[^\]]*\]\s*")
+# saved as if it were a real tool trace; ToolNoteFilter removes it. The
+# prefix matches any case and spacing ("[Tools used :"); a note must close
+# with "]" before any newline or "[" and within TOOL_NOTE_MAX_LEN characters.
+TOOL_NOTE_START_RE = re.compile(r"(?i)\[[ \t]*tools[ \t]+used[ \t]*:")
+TOOL_NOTE_RE = re.compile(r"(?i)\[[ \t]*tools[ \t]+used[ \t]*:[^\[\]\n]*\]")
 TOOL_NOTE_PREFIX = "[tools used:"
+TOOL_NOTE_MAX_LEN = 120  # from the "[" through the "]"
+
+
+def scan_tool_note(tail):
+    """Classify text starting with "[": ("note", end) when tail[:end] is a
+    complete note, ("text", None) when it can no longer be one, or
+    ("wait", None) when more text is needed to decide."""
+    window = tail[:TOOL_NOTE_MAX_LEN]
+    if TOOL_NOTE_START_RE.match(tail):
+        for j in range(1, len(window)):
+            if window[j] in "[]\n":
+                if window[j] == "]" and TOOL_NOTE_RE.fullmatch(tail, 0, j + 1):
+                    return "note", j + 1
+                return "text", None
+        return ("text", None) if len(tail) >= TOOL_NOTE_MAX_LEN else ("wait", None)
+    # Not the full prefix yet: wait only while it could still become one
+    compact = "".join(tail.lower().split())
+    if ("\n" not in tail and len(tail) < TOOL_NOTE_MAX_LEN
+            and TOOL_NOTE_PREFIX.replace(" ", "").startswith(compact)):
+        return "wait", None
+    return "text", None
 
 
 class ToolNoteFilter:
     """Removes imitated "[tools used: ...]" notes from streamed reply text.
 
     A note can be split across stream deltas, so text from a "[" that could
-    still start a note is held back until it either diverges from the prefix
-    (emitted unchanged, so "[laughs]" or "array[3]" pass through) or closes
-    with "]" (dropped, with the whitespace after it). Everything downstream
-    (screen, TTS, memory) sees only filtered text. One instance per turn;
-    `stripped` records whether anything was removed.
+    still start a note is held back until scan_tool_note() decides. Text that
+    turns out not to be a note ("[laughs]", "array[3]", a "[tools used:" that
+    hits a newline or the length cap before "]") is emitted unchanged; a note
+    is dropped with the whitespace after it, and replaced by one space when
+    it sat between two pieces of text with no whitespace before it. Output
+    does not depend on how the text is split into deltas. Everything
+    downstream (screen, TTS, memory) sees only filtered text. One instance
+    per turn; `stripped` records whether anything was removed.
     """
 
     def __init__(self):
         self.pending = ""
         self.skip_ws = False  # drop whitespace that follows a removed note
+        self.space_due = False  # a removed note needs a space before more text
+        self.last_char = None  # last character emitted this round
         self.stripped = False
+
+    def _emit(self, out, text):
+        if not text:
+            return
+        if self.space_due:
+            self.space_due = False
+            if not text[0].isspace():
+                text = " " + text
+        out.append(text)
+        self.last_char = text[-1]
 
     def feed(self, text):
         if self.skip_ws:
@@ -242,32 +281,34 @@ class ToolNoteFilter:
         while self.pending:
             i = self.pending.find("[")
             if i < 0:
-                out.append(self.pending)
+                self._emit(out, self.pending)
                 self.pending = ""
                 break
-            out.append(self.pending[:i])
+            self._emit(out, self.pending[:i])
             tail = self.pending[i:]
-            if not (tail.startswith(TOOL_NOTE_PREFIX) or TOOL_NOTE_PREFIX.startswith(tail)):
-                out.append("[")  # not a note: emit and look past this "["
+            verdict, end = scan_tool_note(tail)
+            if verdict == "wait":
+                self.pending = tail
+                break
+            if verdict == "text":
+                self._emit(out, "[")  # not a note: emit and look past this "["
                 self.pending = tail[1:]
                 continue
-            m = TOOL_NOTE_RE.match(tail)
-            if m is None:
-                self.pending = tail  # incomplete; wait for more text
-                break
             self.stripped = True
-            self.pending = tail[m.end():]
+            if self.last_char is not None and not self.last_char.isspace():
+                self.space_due = True
+            self.pending = tail[end:].lstrip()
             if not self.pending:
                 self.skip_ws = True
         return "".join(out)
 
     def flush(self):
-        """End of a round: release held text (an unclosed note is dropped)."""
-        text, self.pending, self.skip_ws = self.pending, "", False
-        if text.startswith(TOOL_NOTE_PREFIX):
-            self.stripped = True
-            return ""
-        return text
+        """End of a round: release held text unchanged (an unclosed note is
+        not a note) and reset the per-round state."""
+        out = []
+        self._emit(out, self.pending)
+        self.pending, self.skip_ws, self.space_due, self.last_char = "", False, False, None
+        return "".join(out)
 
     def filter(self, deltas):
         """Yield deltas with notes removed, then whatever was held back."""
@@ -664,7 +705,10 @@ Your earlier replies in this conversation are stored as text; the tool calls and
 results that produced them are not kept, except as a short "[tools used: ...]" note.
 An earlier reply marked [tools used: ...] was produced by a real tool call at the
 time (a clock reading, a search, a photo); do not apologize for it or claim it was
-made up. You may still correct a plain factual mistake if later information shows one.
+made up. A tool marked "(failed)" ran but returned an error, so that reply did not
+get a real result from it. You may still correct a plain factual mistake if later
+information shows one. Never write a [tools used: ...] note yourself; it is added
+automatically.
 """
 
 SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n\n" + CURRENT_CONFIG["system_prompt_extras"]
@@ -1966,8 +2010,9 @@ class BotGUI:
         self._start_thinking_sound()
 
         full_response_text = ""
-        # Names of tools actually run this turn (successful or failed), in
-        # first-use order with repeats dropped; saved with the reply.
+        # Tools actually run this turn, as "name" or "name (failed)" (it ran
+        # but returned an error or raised), in first-use order with repeated
+        # labels dropped; saved with the reply.
         tools_used = []
         # Once anything has gone to TTS, later chunks use the longer
         # TTS_MIN_SENTENCE_LENGTH. Reset after each tool round, so the first
@@ -2068,8 +2113,6 @@ class BotGUI:
                             "is_error": True
                         })
                         continue
-                    if block.name not in tools_used:
-                        tools_used.append(block.name)
                     try:
                         result_content, is_error = self.execute_tool(block.name, block.input)
                         tool_result = {
@@ -2083,12 +2126,16 @@ class BotGUI:
                     except Exception as e:
                         # Report the failure to Claude instead of aborting the turn
                         log.exception(f"[TOOL] {block.name} failed: {e!r}")
+                        is_error = True
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
                             "content": f"Tool {block.name} failed: {e}",
                             "is_error": True
                         })
+                    label = f"{block.name} (failed)" if is_error else block.name
+                    if label not in tools_used:
+                        tools_used.append(label)
                 # Interrupted: don't send the results or restart the thinking
                 # sound; the code after the loop finishes the turn quietly
                 if self.interrupted.is_set():

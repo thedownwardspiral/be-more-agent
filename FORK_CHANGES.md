@@ -475,4 +475,21 @@ fallback.
 - **Attribution**: Parakeet-TDT 0.6B v2 is CC-BY-4.0 (NVIDIA); credited in
   the README's Acknowledgments. The model is downloaded by setup.sh, not
   committed.
-- **Tool trace in memory**: each saved reply records the tools that produced it (`"tools": [...]` in memory.json), sent to Claude as a `[tools used: ...]` note, and the system prompt says not to "correct" earlier answers, so Claude stops apologizing for times and photos it really did fetch.
+
+## Tool trace in memory
+
+- **`tools` key**: each saved reply in memory.json records the tools run that
+  turn, in first-use order, as `name` or `name (failed)` when the call
+  returned an error or raised.
+- **History note**: `_history_messages()` sends such a reply to Claude with a
+  `[tools used: ...]` line after its text; the screen and TTS never show it.
+- **Prompt rule**: a reply marked with the note came from a real tool call,
+  so Claude should not apologize for it or call it made up; "(failed)" means
+  the tool ran but returned an error; plain factual mistakes may still be
+  corrected; Claude must never write the note itself.
+- **ToolNoteFilter**: strips an imitated note (any case and spacing) from the
+  stream. A note must close with `]` before a newline or `[` and within 120
+  characters, otherwise the text is released unchanged; a removed note
+  between two words becomes one space. Output is independent of delta splits.
+- **Give-up fallback**: when the tool-round cap is hit with no reply, the
+  spoken "I couldn't finish that one." is saved with the reply too.
