@@ -590,3 +590,6 @@ Claude; the turn ends through the usual path (no memory save, TTS drained,
   gaps, and decoded in 7.6 s with +150 MB peak RSS, versus 10.0 s and
   +383 MB in one call, with the same words. Audio up to 25 s is decoded in
   one call as before; the whisper fallback is unchanged.
+- **Transcribing state**: every trigger now shows THINKING "Transcribing..."
+  during speech-to-text, and a spacebar pressed then discards the recording
+  instead of letting the bot answer it anyway (e.g. after the 60 s cap).

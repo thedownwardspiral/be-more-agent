@@ -537,7 +537,7 @@ WHISPER_ONLY_HALLUCINATIONS = {normalize_words(p) for p in (
 # never stored. Ids and names must fit the API's tool_use patterns, or every
 # later request would be rejected.
 TOOL_RECORD_INPUT_MAX = 200   # per string value in the tool input
-TOOL_RECORD_RESULT_MAX = 600   # keeps a search result's 300-char snippet plus its prefix
+TOOL_RECORD_RESULT_MAX = 600   # usually enough for a search result's 300-char snippet plus its prefix
 TOOL_RECORD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
@@ -871,14 +871,13 @@ class BotGUI:
         self.ptt_lock = threading.Lock()
         self.interrupted = threading.Event() 
         # The open Claude response stream, set by the main loop while it reads
-        # one; a spacebar interrupt closes it from the Tk thread
+        # one; a spacebar interrupt shuts its socket down from the Tk thread
         self.active_stream = None
         
         # Two-stage TTS: the synth thread turns tts_queue text into PCM on
         # audio_queue while the playback thread plays the previous sentence
         self.tts_queue = queue.Queue()
         self.tts_thread = None
-        # Set while the synth thread works on an item
         # (int16 bytes, sample rate) chunks and TTS_ITEM_END markers; bounded
         # so synthesis can't run far ahead of what is being heard
         self.audio_queue = queue.Queue(maxsize=16)
@@ -1279,7 +1278,6 @@ class BotGUI:
         # No cross-thread close(): it could not wake a blocked reader and could
         # race its fd. The reader's per-chunk interrupted check ends the read.
         log.debug("[LLM] Stream not cancelled on interrupt; the reader stops at its next chunk")
-        return
 
     def load_animations(self):
         base_path = "faces"
@@ -1526,7 +1524,17 @@ class BotGUI:
                         self.set_state(BotStates.IDLE, "Heard nothing.")
                         continue
 
+                    # THINKING for every trigger: the decode can take seconds,
+                    # and a spacebar here discards the recording (below)
+                    self.set_state(BotStates.THINKING, "Transcribing...")
                     user_text = self.transcribe_audio(audio)
+                    if self.interrupted.is_set():
+                        # The decode itself can't be cut short, but its text
+                        # is dropped instead of answered
+                        self.interrupted.clear()
+                        log.info("[MAIN] Interrupted during transcription; recording discarded")
+                        self.set_state(BotStates.IDLE, "Interrupted.")
+                        continue
                     if not user_text:
                         self.set_state(BotStates.IDLE, "Transcription empty.")
                         continue
@@ -2023,7 +2031,6 @@ class BotGUI:
             log.info("[AUDIO] Skipping transcription — audio too quiet.")
             return ""
 
-        log.info("Transcribing...")
         engine = "parakeet" if self.recognizer is not None else "whisper"
         t0 = time.monotonic()
         if engine == "parakeet":
