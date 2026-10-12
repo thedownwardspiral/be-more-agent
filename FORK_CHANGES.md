@@ -543,7 +543,8 @@ up to 20 s for `rpicam-still`. Each span now checks every `INTERRUPT_POLL`
   The shutdown matters: on Linux, closing the fd alone does not wake a thread
   blocked on it, so a stalled stream would wait out the 60 s read timeout;
   with no socket exposed it only logs at debug (no cross-thread `close()`;
-  the reader's per-chunk `interrupted` check ends the read). A request error
+  the reader's per-chunk `interrupted` check ends the read once text
+  arrives). A request error
   that coincides with an interrupt in `_open_stream()` also shows as the
   interrupt, and the API counts as answered (clearing a stale startup error)
   once the response headers arrive.
@@ -593,3 +594,5 @@ Claude; the turn ends through the usual path (no memory save, TTS drained,
 - **Transcribing state**: every trigger now shows THINKING "Transcribing..."
   during speech-to-text, and a spacebar pressed then discards the recording
   instead of letting the bot answer it anyway (e.g. after the 60 s cap).
+  The check runs before the decode too, so a spacebar during the cap's ack
+  sound skips it, and the cap's "That's all I can hold!" is not overwritten.

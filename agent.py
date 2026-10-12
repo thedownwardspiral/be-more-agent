@@ -1260,7 +1260,7 @@ class BotGUI:
         thread blocked in poll/recv on it, so a stalled stream would sit until
         the 60s read timeout. shutdown() does wake it. With no socket to shut
         down this only logs at debug: the reader's per-chunk `interrupted`
-        check still ends the read once data flows."""
+        check still ends the read once text arrives."""
         s = self.active_stream
         if s is None:
             return
@@ -1524,23 +1524,28 @@ class BotGUI:
                         self.set_state(BotStates.IDLE, "Heard nothing.")
                         continue
 
+                    # A spacebar during the ack sound (e.g. after the 60 s cap,
+                    # already THINKING) skips the decode entirely
+                    if self._discard_if_interrupted("before"):
+                        continue
                     # THINKING for every trigger: the decode can take seconds,
-                    # and a spacebar here discards the recording (below)
-                    self.set_state(BotStates.THINKING, "Transcribing...")
+                    # and a spacebar here discards the recording (below). The
+                    # cap path is already THINKING; keep its message.
+                    if self.current_state != BotStates.THINKING:
+                        self.set_state(BotStates.THINKING, "Transcribing...")
                     user_text = self.transcribe_audio(audio)
-                    if self.interrupted.is_set():
-                        # The decode itself can't be cut short, but its text
-                        # is dropped instead of answered
-                        self.interrupted.clear()
-                        log.info("[MAIN] Interrupted during transcription; recording discarded")
-                        self.set_state(BotStates.IDLE, "Interrupted.")
+                    # The decode itself can't be cut short, but its text is
+                    # dropped instead of answered. This check covers every way
+                    # the flag can be set before chat_and_respond, so no
+                    # clear() precedes that call: a press landing after this
+                    # check stays set and ends the turn quietly there.
+                    if self._discard_if_interrupted("during"):
                         continue
                     if not user_text:
                         self.set_state(BotStates.IDLE, "Transcription empty.")
                         continue
                 
                     self.append_to_text(f"YOU: {user_text}")
-                    self.interrupted.clear()
                     self.chat_and_respond(user_text)
                 except Exception:
                     log.exception("[MAIN] Turn failed; recovering")
@@ -1557,6 +1562,16 @@ class BotGUI:
         except Exception as e:
             log.exception("[CRITICAL] Main loop crashed")
             self.set_state(BotStates.ERROR, f"Fatal Error: {str(e)[:40]}")
+
+    def _discard_if_interrupted(self, when):
+        """If a spacebar was pressed, drop the recording and go back to IDLE.
+        `when` is "before" or "during" transcription. Returns True if so."""
+        if not self.interrupted.is_set():
+            return False
+        self.interrupted.clear()
+        log.info(f"[MAIN] Interrupted {when} transcription; recording discarded")
+        self.set_state(BotStates.IDLE, "Interrupted.")
+        return True
 
     def warm_up_logic(self):
         self.set_state(BotStates.WARMUP, "Warming up brains...")
