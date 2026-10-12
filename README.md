@@ -202,7 +202,7 @@ If you change `text_model` (or set `ANTHROPIC_MODEL` in `.env`, which overrides 
 ### Privacy & files
 
 * The conversation can end up in two places, each with its own switch:
-  * `memory.json` holds the recent conversation (the last 10 messages) so it survives restarts. Controlled by `chat_memory`; with `"chat_memory": false` it is never read or written.
+  * `memory.json` holds the recent conversation (the last 10 messages) so it survives restarts, including each reply's tool calls (tool inputs such as search queries and up to 600 chars of tool results; never image data). Controlled by `chat_memory`; with `"chat_memory": false` it is never read or written.
   * `agent.log` records each turn's transcript (`Heard: ...`, `[PIPER SPEAKING] ...`, web search queries) alongside the runtime log. It is rotated at 1 MB with 3 backups (`agent.log.1`–`.3`). Controlled by `log_transcripts`; with `"log_transcripts": false` those lines are still written but logged as `<redacted, N chars>`, so you can see activity without content. Turning `chat_memory` off does **not** stop these log lines; set both to `false` to keep no transcript on disk.
 * `memory.json`, `agent.log` and its backups, plus `.env`, are kept at mode 600 (owner only) by the agent at startup and by `setup.sh`.
 * Voice recordings stay in memory with Parakeet. With the whisper fallback, and for camera photos, they are written to a private temporary directory and deleted as soon as they have been used (and the directory is removed at exit; one left behind by a crash or power loss is removed on the next start).

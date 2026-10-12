@@ -52,9 +52,6 @@ stack with the cloud-based Anthropic API (Claude).
 - **Sentence buffer flush**: After streaming completes, any remaining
   text in `sentence_buffer` is flushed to TTS. The original did not
   flush leftover text.
-- **TTS init**: `self.tts_active` is cleared before starting the TTS
-  worker thread. The original set it, which could cause `wait_for_tts()`
-  to block on the first call.
 
 ## Display: DSI Touchscreen Support
 
@@ -479,9 +476,9 @@ fallback.
 ## Tool trace in memory
 
 - **`tool_calls` records**: each saved reply in memory.json keeps one compact
-  record per tool executed that turn: a synthetic id (`toolu_mem_<8 hex>`),
+  record per tool executed that turn: the API's own `tool_use` id (`toolu_01…`),
   the name, the input (strings capped at 200 chars), the result text (capped
-  at 300 chars) and an `error` flag. Photos are never stored; a camera call
+  at 600 chars) and an `error` flag. Photos are never stored; a camera call
   is recorded as "photo captured (image not retained)".
 - **Replay**: `_history_messages()` sends such a reply to Claude as the calls
   that produced it: `tool_use` blocks, the matching `tool_result` blocks
@@ -542,10 +539,12 @@ up to 20 s for `rpicam-still`. Each span now checks every `INTERRUPT_POLL`
   read wakes immediately (0.3 ms against a stalled test server) and raises
   `httpx.RemoteProtocolError` (incomplete chunked read) or `httpx.ReadError`.
   Any exception raised while `interrupted` is set is classified as the
-  interrupt, not an error, and logged at debug with its type and raising line.
+  interrupt, not an error, and logged at debug with its full stack.
   The shutdown matters: on Linux, closing the fd alone does not wake a thread
   blocked on it, so a stalled stream would wait out the 60 s read timeout;
-  `close()` is only the fallback when no socket is exposed. A request error
+  with no socket exposed it only logs at debug (no cross-thread `close()`;
+  the reader's per-chunk `interrupted` check ends the read once text
+  arrives). A request error
   that coincides with an interrupt in `_open_stream()` also shows as the
   interrupt, and the API counts as answered (clearing a stale startup error)
   once the response headers arrive.
@@ -569,6 +568,7 @@ Claude; the turn ends through the usual path (no memory save, TTS drained,
   (60 s) if Enter is never pressed again. It logs
   `[PTT] Max recording length reached (60 s)`, clears `recording_active`
   (the next Enter starts a new recording), shows "That's all I can hold!"
+  on the THINKING face (the mic is already closed)
   and transcribes what was recorded. Before, a forgotten PTT session grew
   without limit, and one Parakeet decode of minutes of audio froze the bot
   (Pi 5: 90 s took 20.5 s and +830 MB, 180 s took 58.5 s and +1.7 GB, on
@@ -591,3 +591,8 @@ Claude; the turn ends through the usual path (no memory save, TTS drained,
   gaps, and decoded in 7.6 s with +150 MB peak RSS, versus 10.0 s and
   +383 MB in one call, with the same words. Audio up to 25 s is decoded in
   one call as before; the whisper fallback is unchanged.
+- **Transcribing state**: every trigger now shows THINKING "Transcribing..."
+  during speech-to-text, and a spacebar pressed then discards the recording
+  instead of letting the bot answer it anyway (e.g. after the 60 s cap).
+  The check runs before the decode too, so a spacebar during the cap's ack
+  sound skips it, and the cap's "That's all I can hold!" is not overwritten.
