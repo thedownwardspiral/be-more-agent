@@ -87,7 +87,6 @@ import socket
 import stat
 import shutil
 import tempfile
-import traceback
 import fcntl
 
 # Suppress harmless library warnings
@@ -402,7 +401,8 @@ STT_SPLIT_FRAME = 0.02
 # No chunk after the last cut may be shorter than this: Parakeet invents a
 # filler ("Okay.", "Mm-hmm.") for a lone sub-second near-silent chunk.
 STT_MIN_LAST_CHUNK = 2.0
-# Chunks shorter than this are not decoded at all (safety net for the above)
+# Chunks shorter than this are not decoded at all (safety net for the above;
+# cannot fire with the current constants)
 STT_MIN_DECODE_CHUNK = 1.0
 
 def stt_split_points(audio, rate=STT_SAMPLE_RATE):
@@ -414,10 +414,8 @@ def stt_split_points(audio, rate=STT_SAMPLE_RATE):
     STT_SPLIT_SEARCH after it, a window end at the cap, and a cut
     STT_MIN_LAST_CHUNK before the end of the audio. That is a pause when the
     range has one; continuous speech can still be cut between syllables.
-    Should that range ever be empty, the rest is split into two near-equal
-    halves at the quietest window within STT_SPLIT_SEARCH of the midpoint
-    (each half stays under the cap). Returns [] when the audio fits in one
-    chunk."""
+    The range is never empty with the current constants (asserted). Returns []
+    when the audio fits in one chunk."""
     n = len(audio)
     max_len = int(STT_CHUNK_SECONDS * rate)
     if n <= max_len:
@@ -449,15 +447,9 @@ def stt_split_points(audio, rate=STT_SAMPLE_RATE):
         # must leave at least STT_MIN_LAST_CHUNK of audio after it
         hi = min(len(win_energy) - 1, prev + cap - win, target + search,
                  n_frames - min_last - win // 2)
-        if hi < lo:
-            # No valid window (not expected while > STT_CHUNK_SECONDS remain):
-            # split the rest into two halves instead (each well under the cap)
-            mid = (prev + n_frames) // 2 - win // 2
-            lo = max(prev + 1, mid - search)
-            hi = min(len(win_energy) - 1, mid + search)
-            cut = quietest(lo, hi, mid) + win // 2
-            points.append(cut * frame)
-            break
+        # Unreachable: while > STT_CHUNK_SECONDS remain the range always holds
+        # a window (proven for all lengths with the current constants)
+        assert hi >= lo, "stt_split_points: empty search range with > STT_CHUNK_SECONDS left"
         cut = quietest(lo, hi, target) + win // 2
         points.append(cut * frame)
         prev = cut
@@ -545,7 +537,7 @@ WHISPER_ONLY_HALLUCINATIONS = {normalize_words(p) for p in (
 # never stored. Ids and names must fit the API's tool_use patterns, or every
 # later request would be rejected.
 TOOL_RECORD_INPUT_MAX = 200   # per string value in the tool input
-TOOL_RECORD_RESULT_MAX = 300
+TOOL_RECORD_RESULT_MAX = 600   # keeps a search result's 300-char snippet plus its prefix
 TOOL_RECORD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
@@ -553,8 +545,9 @@ def _cap_text(text, limit):
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
-def make_tool_record(name, tool_input, result_content, is_error):
-    """A compact, JSON-safe record of one executed tool call."""
+def make_tool_record(tool_id, name, tool_input, result_content, is_error):
+    """A compact, JSON-safe record of one executed tool call. tool_id is the
+    API's own tool_use id (server-unique, so ids never collide in memory)."""
     if isinstance(result_content, str):
         result = result_content
     elif name == "capture_image" and not is_error:
@@ -564,7 +557,7 @@ def make_tool_record(name, tool_input, result_content, is_error):
     if not isinstance(tool_input, dict):
         tool_input = {}
     return {
-        "id": f"toolu_mem_{os.urandom(4).hex()}",
+        "id": tool_id,
         "name": name,
         "input": {k: _cap_text(v, TOOL_RECORD_INPUT_MAX) if isinstance(v, str) else v
                   for k, v in tool_input.items()},
@@ -886,7 +879,6 @@ class BotGUI:
         self.tts_queue = queue.Queue()
         self.tts_thread = None
         # Set while the synth thread works on an item
-        self.tts_active = threading.Event()
         # (int16 bytes, sample rate) chunks and TTS_ITEM_END markers; bounded
         # so synthesis can't run far ahead of what is being heard
         self.audio_queue = queue.Queue(maxsize=16)
@@ -1118,7 +1110,6 @@ class BotGUI:
         log.info("--- SHUTDOWN SEQUENCE ---")
         self.recording_active.clear()
         self.thinking_sound_active.clear()
-        self.tts_active.clear()
 
         self.save_chat_history()
 
@@ -1268,7 +1259,9 @@ class BotGUI:
         the reader's fd (it could be reused before the reader's recv). close()
         also wouldn't help: on Linux, closing a socket fd does not wake a
         thread blocked in poll/recv on it, so a stalled stream would sit until
-        the 60s read timeout. shutdown() does wake it."""
+        the 60s read timeout. shutdown() does wake it. With no socket to shut
+        down this only logs at debug: the reader's per-chunk `interrupted`
+        check still ends the read once data flows."""
         s = self.active_stream
         if s is None:
             return
@@ -1283,12 +1276,10 @@ class BotGUI:
                 return
             except Exception as e:
                 log.debug(f"[LLM] Shutting the socket down on interrupt failed: {e!r}")
-        # No socket to shut down: close() is the best available, though it
-        # won't wake a reader already blocked on the socket
-        try:
-            s.close()
-        except Exception as e:
-            log.debug(f"[LLM] Closing the stream on interrupt failed: {e!r}")
+        # No cross-thread close(): it could not wake a blocked reader and could
+        # race its fd. The reader's per-chunk interrupted check ends the read.
+        log.debug("[LLM] Stream not cancelled on interrupt; the reader stops at its next chunk")
+        return
 
     def load_animations(self):
         base_path = "faces"
@@ -1941,7 +1932,7 @@ class BotGUI:
                 self.recording_active.clear()
             if capped:
                 log.info(f"[PTT] Max recording length reached ({MAX_PTT_RECORD_TIME:.0f} s)")
-                self.set_state(BotStates.LISTENING, "That's all I can hold!")
+                self.set_state(BotStates.THINKING, "That's all I can hold!")
 
         audio = self._buffer_to_stt_rate(buffer, samplerate)
         if audio is not None:
@@ -2063,6 +2054,8 @@ class BotGUI:
             for i in range(len(bounds) - 1):
                 chunk = audio[bounds[i]:bounds[i + 1]]
                 if len(chunk) < STT_MIN_DECODE_CHUNK * STT_SAMPLE_RATE:
+                    # Safety net only: with the current constants every chunk
+                    # is >= STT_MIN_LAST_CHUNK (2 s), so this cannot fire.
                     # Parakeet invents a filler word for a short quiet chunk
                     log.debug(f"[STT] parakeet chunk {i + 1}/{len(bounds) - 1}: skipped "
                               f"({len(chunk) / STT_SAMPLE_RATE:.2f}s of audio)")
@@ -2375,9 +2368,8 @@ class BotGUI:
                     # case it was a real bug in the UI/TTS code above.
                     if not self.interrupted.is_set():
                         raise
-                    tb = traceback.extract_tb(e.__traceback__)
-                    where = f" at {os.path.basename(tb[-1].filename)}:{tb[-1].lineno}" if tb else ""
-                    log.debug(f"[LLM] Exception during interrupted stream{where}: {_err_summary(e)}")
+                    log.debug(f"[LLM] Exception during interrupted stream: {_err_summary(e)}",
+                              exc_info=True)
                     log.info(f"[LLM] Response stream closed by interrupt ({type(e).__name__})")
                 finally:
                     self.active_stream = None
@@ -2438,7 +2430,7 @@ class BotGUI:
                             "is_error": True
                         })
                     tool_calls.append(make_tool_record(
-                        block.name, block.input, tool_results[-1]["content"], is_error))
+                        block.id, block.name, block.input, tool_results[-1]["content"], is_error))
                 # Interrupted: don't send the results or restart the thinking
                 # sound; the code after the loop finishes the turn quietly
                 if self.interrupted.is_set():
@@ -2525,7 +2517,6 @@ class BotGUI:
                 or not self.audio_queue.empty() or not self.playback_idle.is_set())
 
     def _start_tts_threads(self):
-        self.tts_active.clear()
         self.playback_idle.set()
         self.tts_thread = threading.Thread(target=self._tts_worker, name="tts-synth", daemon=True)
         self.playback_thread = threading.Thread(target=self._playback_worker, name="tts-playback", daemon=True)
@@ -2574,12 +2565,10 @@ class BotGUI:
             try:
                 if self.interrupted.is_set():
                     continue
-                self.tts_active.set()
                 self._synthesize(text)
             except Exception as e:
                 log.error(f"[PIPER] Synthesis failed: {e}")
             finally:
-                self.tts_active.clear()
                 # Only now: every chunk of this item is already on audio_queue,
                 # so wait_for_tts's audio_queue.join() covers all of it
                 self.tts_queue.task_done()
