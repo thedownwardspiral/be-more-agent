@@ -208,115 +208,6 @@ TTS_SENTENCE_END_RE = re.compile(r'[.!?…]+["\'”’)\]]*(?=\s)')
 TTS_ABBREVIATION_RE = re.compile(
     r'(?i)^(?:(?:[a-z]\.)*[a-z]|\d{1,2}|mr|mrs|ms|dr|st|jr|sr|vs|etc|prof|mt|no)$'
 )
-# The "[tools used: ...]" note _history_messages() appends to earlier replies.
-# Claude may imitate it in a new reply, where it would be spoken, shown and
-# saved as if it were a real tool trace; ToolNoteFilter removes it. The
-# prefix matches any case and spacing ("[Tools used :"); a note must close
-# with "]" before any newline or "[" and within TOOL_NOTE_MAX_LEN characters.
-TOOL_NOTE_START_RE = re.compile(r"(?i)\[[ \t]*tools[ \t]+used[ \t]*:")
-TOOL_NOTE_RE = re.compile(r"(?i)\[[ \t]*tools[ \t]+used[ \t]*:[^\[\]\n]*\]")
-TOOL_NOTE_PREFIX = "[tools used:"
-TOOL_NOTE_MAX_LEN = 120  # from the "[" through the "]"
-
-
-def scan_tool_note(tail):
-    """Classify text starting with "[": ("note", end) when tail[:end] is a
-    complete note, ("text", None) when it can no longer be one, or
-    ("wait", None) when more text is needed to decide."""
-    window = tail[:TOOL_NOTE_MAX_LEN]
-    if TOOL_NOTE_START_RE.match(tail):
-        for j in range(1, len(window)):
-            if window[j] in "[]\n":
-                if window[j] == "]" and TOOL_NOTE_RE.fullmatch(tail, 0, j + 1):
-                    return "note", j + 1
-                return "text", None
-        return ("text", None) if len(tail) >= TOOL_NOTE_MAX_LEN else ("wait", None)
-    # Not the full prefix yet: wait only while it could still become one
-    compact = "".join(tail.lower().split())
-    if ("\n" not in tail and len(tail) < TOOL_NOTE_MAX_LEN
-            and TOOL_NOTE_PREFIX.replace(" ", "").startswith(compact)):
-        return "wait", None
-    return "text", None
-
-
-class ToolNoteFilter:
-    """Removes imitated "[tools used: ...]" notes from streamed reply text.
-
-    A note can be split across stream deltas, so text from a "[" that could
-    still start a note is held back until scan_tool_note() decides. Text that
-    turns out not to be a note ("[laughs]", "array[3]", a "[tools used:" that
-    hits a newline or the length cap before "]") is emitted unchanged; a note
-    is dropped with the whitespace after it, and replaced by one space when
-    it sat between two pieces of text with no whitespace before it. Output
-    does not depend on how the text is split into deltas. Everything
-    downstream (screen, TTS, memory) sees only filtered text. One instance
-    per turn; `stripped` records whether anything was removed.
-    """
-
-    def __init__(self):
-        self.pending = ""
-        self.skip_ws = False  # drop whitespace that follows a removed note
-        self.space_due = False  # a removed note needs a space before more text
-        self.last_char = None  # last character emitted this round
-        self.stripped = False
-
-    def _emit(self, out, text):
-        if not text:
-            return
-        if self.space_due:
-            self.space_due = False
-            if not text[0].isspace():
-                text = " " + text
-        out.append(text)
-        self.last_char = text[-1]
-
-    def feed(self, text):
-        if self.skip_ws:
-            text = text.lstrip()
-            if not text:
-                return ""
-            self.skip_ws = False
-        self.pending += text
-        out = []
-        while self.pending:
-            i = self.pending.find("[")
-            if i < 0:
-                self._emit(out, self.pending)
-                self.pending = ""
-                break
-            self._emit(out, self.pending[:i])
-            tail = self.pending[i:]
-            verdict, end = scan_tool_note(tail)
-            if verdict == "wait":
-                self.pending = tail
-                break
-            if verdict == "text":
-                self._emit(out, "[")  # not a note: emit and look past this "["
-                self.pending = tail[1:]
-                continue
-            self.stripped = True
-            if self.last_char is not None and not self.last_char.isspace():
-                self.space_due = True
-            self.pending = tail[end:].lstrip()
-            if not self.pending:
-                self.skip_ws = True
-        return "".join(out)
-
-    def flush(self):
-        """End of a round: release held text unchanged (an unclosed note is
-        not a note) and reset the per-round state."""
-        out = []
-        self._emit(out, self.pending)
-        self.pending, self.skip_ws, self.space_due, self.last_char = "", False, False, None
-        return "".join(out)
-
-    def filter(self, deltas):
-        """Yield deltas with notes removed, then whatever was held back."""
-        for delta in deltas:
-            yield self.feed(delta)
-        yield self.flush()
-
-
 def last_sentence_end(buffer):
     """Index just past the last sentence end in buffer, or None.
 
@@ -562,12 +453,59 @@ WHISPER_ONLY_HALLUCINATIONS = {normalize_words(p) for p in (
     "subtitles by the amara.org community",
 )}
 
+# A saved reply's tool calls ("tool_calls" in memory.json), replayed to Claude
+# as real tool_use / tool_result blocks so it can see that an earlier answer
+# came from a tool. Kept small: inputs and results are capped, and photos are
+# never stored. Ids and names must fit the API's tool_use patterns, or every
+# later request would be rejected.
+TOOL_RECORD_INPUT_MAX = 200   # per string value in the tool input
+TOOL_RECORD_RESULT_MAX = 300
+TOOL_RECORD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _cap_text(text, limit):
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def make_tool_record(name, tool_input, result_content, is_error):
+    """A compact, JSON-safe record of one executed tool call."""
+    if isinstance(result_content, str):
+        result = result_content
+    elif name == "capture_image" and not is_error:
+        result = "photo captured (image not retained)"
+    else:
+        result = "(result not retained)"
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+    return {
+        "id": f"toolu_mem_{os.urandom(4).hex()}",
+        "name": name,
+        "input": {k: _cap_text(v, TOOL_RECORD_INPUT_MAX) if isinstance(v, str) else v
+                  for k, v in tool_input.items()},
+        "result": _cap_text(result, TOOL_RECORD_RESULT_MAX) or "(no output)",
+        "error": bool(is_error),
+    }
+
+
+def is_valid_tool_record(r):
+    return (isinstance(r, dict)
+            and isinstance(r.get("id"), str) and bool(TOOL_RECORD_ID_RE.match(r["id"]))
+            and isinstance(r.get("name"), str) and bool(TOOL_RECORD_ID_RE.match(r["name"]))
+            and isinstance(r.get("input"), dict)
+            and isinstance(r.get("result"), str)
+            and isinstance(r.get("error"), bool))
+
+
 def is_valid_memory(history):
     """True if history is a well-formed memory.json: a system entry first, then
-    user/assistant entries only, each with non-empty string content. An entry
-    may carry an optional "tools" key: a list of tool-name strings."""
+    user/assistant entries only, each with non-empty string content. An
+    assistant entry may carry an optional "tool_calls" list of tool records
+    (see make_tool_record; ids unique across the file). Any entry may still
+    carry a legacy "tools" list of strings from older builds, which
+    load_chat_history() drops."""
     if not isinstance(history, list) or not history:
         return False
+    seen_ids = set()
     for i, m in enumerate(history):
         if not isinstance(m, dict):
             return False
@@ -582,6 +520,14 @@ def is_valid_memory(history):
             tools = m["tools"]
             if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
                 return False
+        if "tool_calls" in m:
+            calls = m["tool_calls"]
+            if m["role"] != "assistant" or not isinstance(calls, list):
+                return False
+            for r in calls:
+                if not is_valid_tool_record(r) or r["id"] in seen_ids:
+                    return False
+                seen_ids.add(r["id"])
     return True
 
 # Memory wipe fires only when the *whole* utterance is the command (after a
@@ -701,14 +647,7 @@ user asks for something a tool provides; otherwise just chat.
 
 Your replies are spoken aloud, so keep them short and conversational.
 You cannot erase your own memory; if asked to, tell the user to say "forget everything".
-Your earlier replies in this conversation are stored as text; the tool calls and
-results that produced them are not kept, except as a short "[tools used: ...]" note.
-An earlier reply marked [tools used: ...] was produced by a real tool call at the
-time (a clock reading, a search, a photo); do not apologize for it or claim it was
-made up. A tool marked "(failed)" ran but returned an error, so that reply did not
-get a real result from it. You may still correct a plain factual mistake if later
-information shows one. Never write a [tools used: ...] note yourself; it is added
-automatically.
+Earlier turns may include the tool calls and results that produced your replies.
 """
 
 SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n\n" + CURRENT_CONFIG["system_prompt_extras"]
@@ -1978,17 +1917,33 @@ class BotGUI:
 
     def _history_messages(self):
         """Chat history as Anthropic messages (skips legacy system entries).
-        A reply's tool trace is rendered as a note after its text, so Claude
-        can see the earlier answer was backed by a real tool call."""
+        A reply with "tool_calls" is replayed as the calls that produced it:
+        an assistant message of tool_use blocks, a user message of the
+        matching tool_result blocks, then the reply text. No thinking blocks
+        are stored or replayed, so there is nothing for the API to bind."""
         history = []
         recent = [m for m in (self.permanent_memory + self.session_memory) if m["role"] != "system"]
+        # MAX_HISTORY_MESSAGES counts memory entries, not rendered API
+        # messages: a reply with tool calls renders as three messages.
         for msg in recent[-MAX_HISTORY_MESSAGES:]:
             if not history and msg["role"] != "user":
                 continue  # API conversations must start with a user message
-            content = msg["content"]
-            if msg["role"] == "assistant" and msg.get("tools"):
-                content += f"\n[tools used: {', '.join(msg['tools'])}]"
-            history.append({"role": msg["role"], "content": content})
+            if msg["role"] == "assistant" and history[-1]["role"] == "assistant":
+                continue  # memory never has two replies in a row; don't send one
+            calls = msg.get("tool_calls") if msg["role"] == "assistant" else None
+            if calls:
+                history.append({"role": "assistant", "content": [
+                    {"type": "tool_use", "id": c["id"], "name": c["name"], "input": c["input"]}
+                    for c in calls
+                ]})
+                results = []
+                for c in calls:
+                    block = {"type": "tool_result", "tool_use_id": c["id"], "content": c["result"]}
+                    if c["error"]:
+                        block["is_error"] = True
+                    results.append(block)
+                history.append({"role": "user", "content": results})
+            history.append({"role": msg["role"], "content": msg["content"]})
         return history
 
     def chat_and_respond(self, text):
@@ -2035,18 +1990,15 @@ class BotGUI:
         self._start_thinking_sound()
 
         full_response_text = ""
-        # Tools actually run this turn, as "name" or "name (failed)" (it ran
-        # but returned an error or raised), in first-use order with repeated
-        # labels dropped; saved with the reply.
-        tools_used = []
+        # Records of the tools actually run this turn (make_tool_record), in
+        # call order; saved with the reply and replayed in later turns.
+        tool_calls = []
         # Once anything has gone to TTS, later chunks use the longer
         # TTS_MIN_SENTENCE_LENGTH. Reset after each tool round, so the first
         # sentence after a (silent) tool call also starts quickly.
         first_chunk_sent = False
         # Set when the tool-free last round below still produced no text
         gave_up = False
-        # Drops "[tools used: ...]" notes Claude copies from its history
-        note_filter = ToolNoteFilter()
 
         try:
             client = get_llm_client()
@@ -2066,7 +2018,7 @@ class BotGUI:
                     model=TEXT_MODEL, messages=messages, system=SYSTEM_PROMPT,
                     tools=turn_tools, max_tokens=MAX_RESPONSE_TOKENS, **round_kwargs, **LLM_KWARGS
                 ) as stream:
-                    for content in note_filter.filter(stream.text_stream):
+                    for content in stream.text_stream:
                         if self.interrupted.is_set(): break
                         if not content: continue
                         if not round_started:
@@ -2158,9 +2110,8 @@ class BotGUI:
                             "content": f"Tool {block.name} failed: {e}",
                             "is_error": True
                         })
-                    label = f"{block.name} (failed)" if is_error else block.name
-                    if label not in tools_used:
-                        tools_used.append(label)
+                    tool_calls.append(make_tool_record(
+                        block.name, block.input, tool_results[-1]["content"], is_error))
                 # Interrupted: don't send the results or restart the thinking
                 # sound; the code after the loop finishes the turn quietly
                 if self.interrupted.is_set():
@@ -2189,15 +2140,12 @@ class BotGUI:
                 # Save what was said, not the unfinished reply on its own
                 full_response_text += fallback
 
-            if note_filter.stripped:
-                log.warning("[LLM] stripped an imitated tools note from the reply")
-
             if not self.interrupted.is_set():
                 self.session_memory.append({"role": "user", "content": text})
                 if full_response_text.strip():
                     reply = {"role": "assistant", "content": full_response_text}
-                    if tools_used:
-                        reply["tools"] = tools_used
+                    if tool_calls:
+                        reply["tool_calls"] = tool_calls
                     self.session_memory.append(reply)
                 if len(self.session_memory) > MAX_HISTORY_MESSAGES:
                     del self.session_memory[:-MAX_HISTORY_MESSAGES]
@@ -2232,10 +2180,11 @@ class BotGUI:
 
     def wait_for_tts(self):
         """Block until everything queued so far has been SPOKEN: synthesized,
-        written to the device, heard, and the stream closed. Every recording
-        path calls this first, so the mic never opens while TTS plays. Interrupts can't
-        deadlock it: the synth stage skips items while interrupted is set and
-        the playback stage drains audio_queue and goes idle on its own."""
+        written to the device, heard, and the stream closed. The paths that
+        end a turn call it, which keeps the mic closed while TTS plays.
+        Interrupts can't deadlock it: the synth stage skips items while
+        interrupted is set and the playback stage drains audio_queue and goes
+        idle on its own."""
         self.tts_queue.join()
         self.audio_queue.join()
         if not self.playback_idle.wait(timeout=10):
@@ -2243,7 +2192,7 @@ class BotGUI:
 
     def _tts_busy(self):
         """True while speech is queued, being synthesized, or playing."""
-        return (self.tts_active.is_set() or not self.tts_queue.empty()
+        return (self.tts_queue.unfinished_tasks != 0
                 or not self.audio_queue.empty() or not self.playback_idle.is_set())
 
     def _start_tts_threads(self):
@@ -2400,8 +2349,11 @@ class BotGUI:
             except queue.Empty:
                 # End of the reply (or of what has been streamed so far):
                 # _close_stream returns once everything written has been heard
-                if (stream is not None and not in_item and not self.tts_active.is_set()
-                        and self.tts_queue.empty()):
+                # unfinished_tasks covers both queued text and the item being
+                # synthesized: task_done runs only after its TTS_ITEM_END is
+                # on audio_queue
+                if (stream is not None and not in_item
+                        and self.tts_queue.unfinished_tasks == 0):
                     self._close_stream(stream, drain_frames)
                     stream = None
                     self.playback_idle.set()
@@ -2549,6 +2501,14 @@ class BotGUI:
         if not is_valid_memory(history):
             log.warning(f"[WARN] {MEMORY_FILE} is malformed. Starting fresh.")
             return fresh
+        # Older builds saved a "tools" list of labels; replies now carry
+        # "tool_calls" records instead, so the labels are dropped.
+        dropped = False
+        for m in history:
+            if m.pop("tools", None) is not None:
+                dropped = True
+        if dropped:
+            log.info(f"{MEMORY_FILE}: dropped legacy tool labels")
         return history
 
     def save_chat_history(self):
@@ -2560,7 +2520,7 @@ class BotGUI:
         with self.memory_lock:
             # The system entry is rebuilt from the current prompt rather than
             # trusting position 0; only the conversation itself is carried over
-            # (entries as-is, so a reply's optional "tools" trace is kept).
+            # (entries as-is, so a reply's optional "tool_calls" are kept).
             conv = [m for m in (self.permanent_memory + self.session_memory) if m.get("role") != "system"]
             if len(conv) > 10: conv = conv[-10:]
             data = [{"role": "system", "content": SYSTEM_PROMPT}] + conv

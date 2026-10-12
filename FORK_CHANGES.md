@@ -478,19 +478,24 @@ fallback.
 
 ## Tool trace in memory
 
-- **`tools` key**: each saved reply in memory.json records the tools run that
-  turn, in first-use order, as `name` or `name (failed)` when the call
-  returned an error or raised.
-- **History note**: `_history_messages()` sends such a reply to Claude with a
-  `[tools used: ...]` line after its text; the screen and TTS never show it.
-- **Prompt rule**: a reply marked with the note came from a real tool call,
-  so Claude should not apologize for it or call it made up; "(failed)" means
-  the tool ran but returned an error; plain factual mistakes may still be
-  corrected; Claude must never write the note itself.
-- **ToolNoteFilter**: strips an imitated note (any case and spacing) from the
-  stream. A note must close with `]` before a newline or `[` and within 120
-  characters, otherwise the text is released unchanged; a removed note
-  between two words becomes one space. Output is independent of delta splits.
+- **`tool_calls` records**: each saved reply in memory.json keeps one compact
+  record per tool executed that turn: a synthetic id (`toolu_mem_<8 hex>`),
+  the name, the input (strings capped at 200 chars), the result text (capped
+  at 300 chars) and an `error` flag. Photos are never stored; a camera call
+  is recorded as "photo captured (image not retained)".
+- **Replay**: `_history_messages()` sends such a reply to Claude as the calls
+  that produced it: `tool_use` blocks, the matching `tool_result` blocks
+  (`is_error` for a failed call), then the reply text. Claude sees a real
+  tool call behind an earlier answer instead of a note in its own words.
+  Verified against Claude Haiku 5.5 (no thinking blocks are replayed).
+- **Migration**: memory files from the previous build (a `tools` list of
+  labels) still load; the labels are dropped with one info log line.
+- **Note and filter removed**: the first version rendered the trace as a
+  bracketed note line inside Claude's earlier replies, with a prompt rule
+  and a stream filter to strip copies. Claude copied the note in the first
+  live session anyway, since it was imitating its own past text; the
+  records keep that evidence out of assistant text, so the note, the prompt
+  sentences about it and the filter are gone.
 - **Give-up fallback**: when the tool-round cap is hit with no reply, the
   spoken "I couldn't finish that one." is saved with the reply too.
 
@@ -513,3 +518,6 @@ fallback.
 - **`wait_for_tts()`** now returns only once queued speech has been heard and
   the stream closed (both queues joined, then `playback_idle`); the main
   loop's per-turn error handler calls it too.
+- **Idle check**: the playback close condition and `_tts_busy()` use
+  `tts_queue.unfinished_tasks == 0`, which covers both queued text and the
+  item being synthesized.
