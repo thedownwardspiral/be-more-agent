@@ -83,9 +83,11 @@ import wave
 import queue
 import collections
 import signal
+import socket
 import stat
 import shutil
 import tempfile
+import traceback
 import fcntl
 
 # Suppress harmless library warnings
@@ -189,6 +191,14 @@ DEFAULT_CONFIG = {
 
 # LLM SETTINGS
 MAX_TOOL_ROUNDS = 5
+# How often a blocking span (opening the API stream, a web search, the camera)
+# checks for a spacebar interrupt, in seconds
+INTERRUPT_POLL = 0.1
+# Overall cap on one search_web call (both DDG searches together), and the
+# per-backend request timeout passed to ddgs
+SEARCH_TIMEOUT = 20.0
+SEARCH_BACKEND_TIMEOUT = 5
+CAMERA_TIMEOUT = 20.0
 TTS_MIN_SENTENCE_LENGTH = 80
 # Lower bar for the first chunk of a turn, and of the text after each tool
 # round: Piper synthesizes a short sentence in ~0.2 s, so waiting for 80 chars
@@ -552,7 +562,8 @@ def get_llm_client():
             # The SDK default timeout is 10 minutes; 60s bounds each request (and
             # each idle gap between streamed chunks). With one retry, a black-holed
             # network stalls a turn for at most 2 attempts x 60s plus backoff,
-            # about 2 minutes, during which wake word and PTT are not listened to.
+            # about 2 minutes, during which wake word and PTT are not listened to
+            # (the spacebar cancels the wait; see _open_stream).
             client = anthropic.Anthropic(timeout=60.0, max_retries=1)
         except anthropic.AnthropicError as e:
             raise MissingAPIKeyError(f"Could not create the Anthropic client: {e}. "
@@ -790,6 +801,9 @@ class BotGUI:
         # loop clearing a press that landed on a wake word
         self.ptt_lock = threading.Lock()
         self.interrupted = threading.Event() 
+        # The open Claude response stream, set by the main loop while it reads
+        # one; a spacebar interrupt closes it from the Tk thread
+        self.active_stream = None
         
         # Two-stage TTS: the synth thread turns tts_queue text into PCM on
         # audio_queue while the playback thread plays the previous sentence
@@ -1157,6 +1171,9 @@ class BotGUI:
         # CAPTURING too: the tool loop drops the photo once the camera returns.
         if self.current_state in (BotStates.SPEAKING, BotStates.THINKING, BotStates.CAPTURING):
             self.interrupted.set()
+            # After interrupted.set(): the main loop publishes a new stream and
+            # then checks interrupted, so one side always sees the other
+            self._cancel_active_stream()
             self.thinking_sound_active.clear()
             while not self.tts_queue.empty():
                 try:
@@ -1165,6 +1182,37 @@ class BotGUI:
                 except queue.Empty:
                     break
             self.set_state(BotStates.IDLE, "Interrupted.")
+
+    def _cancel_active_stream(self):
+        """Shut down the socket of the response stream the main loop is
+        reading, so a reader blocked waiting for the next chunk wakes at once
+        (with an httpx.RemoteProtocolError or ReadError, which chat_and_respond
+        treats as the interrupt). The main loop's own `with stream:` then
+        closes the connection; closing it here, from the Tk thread, could race
+        the reader's fd (it could be reused before the reader's recv). close()
+        also wouldn't help: on Linux, closing a socket fd does not wake a
+        thread blocked in poll/recv on it, so a stalled stream would sit until
+        the 60s read timeout. shutdown() does wake it."""
+        s = self.active_stream
+        if s is None:
+            return
+        sock = None
+        try:
+            sock = s.response.extensions["network_stream"].get_extra_info("socket")
+        except Exception as e:
+            log.debug(f"[LLM] No socket to shut down on interrupt: {e!r}")
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+                return
+            except Exception as e:
+                log.debug(f"[LLM] Shutting the socket down on interrupt failed: {e!r}")
+        # No socket to shut down: close() is the best available, though it
+        # won't wake a reader already blocked on the socket
+        try:
+            s.close()
+        except Exception as e:
+            log.debug(f"[LLM] Closing the stream on interrupt failed: {e!r}")
 
     def load_animations(self):
         base_path = "faces"
@@ -1264,49 +1312,63 @@ class BotGUI:
         if name == "search_web":
             query = tool_input.get("query", "")
             log_transcript("Searching web for:", query)
-            try:
-                # 'us-en' region is often more stable for CLI queries
-                with DDGS() as ddgs:
-                    results = []
-                    search_errors = 0
-                    # 1. News search
-                    try:
-                        results = list(ddgs.news(query, region='us-en', max_results=1))
-                        if results:
-                            log.debug(f"[SEARCH] Found News: {results[0].get('title')}")
-                    except Exception as e:
-                        search_errors += 1
-                        log.warning(f"[SEARCH] News Search Error: {_err_summary(e)}")
 
-                    # 2. Text fallback
-                    if not results:
-                        log.debug("[SEARCH] No news found, trying text search...")
+            def search():
+                try:
+                    # 'us-en' region is often more stable for CLI queries
+                    with DDGS(timeout=SEARCH_BACKEND_TIMEOUT) as ddgs:
+                        results = []
+                        search_errors = 0
+                        # 1. News search
                         try:
-                            results = list(ddgs.text(query, region='us-en', max_results=1))
+                            results = list(ddgs.news(query, region='us-en', max_results=1))
                             if results:
-                                log.debug(f"[SEARCH] Found Text: {results[0].get('title')}")
+                                log.debug(f"[SEARCH] Found News: {results[0].get('title')}")
                         except Exception as e:
                             search_errors += 1
-                            log.warning(f"[SEARCH] Text Search Error: {_err_summary(e)}")
+                            log.warning(f"[SEARCH] News Search Error: {_err_summary(e)}")
 
-                    if results:
-                        r = results[0]
-                        # Safe get
-                        title = r.get('title', 'No Title')
-                        body = r.get('body', r.get('snippet', 'No Body'))
-                        return f"SEARCH RESULTS for '{query}':\nTitle: {title}\nSnippet: {body[:300]}", False
-                    if search_errors == 2:
-                        # Both searches raised: a failure, not an empty result
-                        return "Search failed: the search service is unreachable right now.", True
-                    log.info("[SEARCH] Search returned 0 results.")
-                    return "The search returned no results.", False
-            except Exception as e:
-                log.error(f"[SEARCH] Connection/Library Error: {_err_summary(e)}")
-                return "Search failed: the internet is unreachable right now.", True
+                        # 2. Text fallback
+                        if not results:
+                            log.debug("[SEARCH] No news found, trying text search...")
+                            try:
+                                results = list(ddgs.text(query, region='us-en', max_results=1))
+                                if results:
+                                    log.debug(f"[SEARCH] Found Text: {results[0].get('title')}")
+                            except Exception as e:
+                                search_errors += 1
+                                log.warning(f"[SEARCH] Text Search Error: {_err_summary(e)}")
+
+                        if results:
+                            r = results[0]
+                            # Safe get
+                            title = r.get('title', 'No Title')
+                            body = r.get('body', r.get('snippet', 'No Body'))
+                            return f"SEARCH RESULTS for '{query}':\nTitle: {title}\nSnippet: {body[:300]}", False
+                        if search_errors == 2:
+                            # Both searches raised: a failure, not an empty result
+                            return "Search failed: the search service is unreachable right now.", True
+                        log.info("[SEARCH] Search returned 0 results.")
+                        return "The search returned no results.", False
+                except Exception as e:
+                    log.error(f"[SEARCH] Connection/Library Error: {_err_summary(e)}")
+                    return "Search failed: the internet is unreachable right now.", True
+
+            # On a helper thread, so a spacebar interrupt doesn't wait out a
+            # stalled DDG backend
+            status, value = self._run_interruptible(search, SEARCH_TIMEOUT, "search_web")
+            if status == "done":
+                return value
+            if status == "interrupted":
+                return "interrupted", True
+            log.error(f"[SEARCH] Gave up after {SEARCH_TIMEOUT:.0f}s")
+            return "Search failed: the search service is not responding right now.", True
 
         if name == "capture_image":
             img_path = self.capture_image()
             if not img_path:
+                if self.interrupted.is_set():
+                    return "interrupted", True
                 return "Camera error: no image could be captured.", True
             self.turn_cam_path = img_path
             with open(img_path, "rb") as f:
@@ -1317,6 +1379,45 @@ class BotGUI:
             }], False
 
         return f"Error: unknown tool '{name}'. Available tools: get_time, search_web, capture_image.", True
+
+    def _run_interruptible(self, fn, timeout, label):
+        """Run fn() on a short-lived daemon thread while this thread watches for
+        a spacebar interrupt. Returns ("done", fn's result), ("interrupted",
+        None) or ("timeout", None); re-raises fn's exception. On an interrupt
+        or timeout the thread is abandoned: it finishes on its own (bounded by
+        fn's own timeouts) and its result is discarded."""
+        box = {}
+
+        def run():
+            try:
+                box["result"] = fn()
+            except BaseException as e:
+                box["error"] = e
+
+        thread = threading.Thread(target=run, daemon=True, name=f"tool-{label}")
+        deadline = time.monotonic() + timeout
+        thread.start()
+        while thread.is_alive():
+            if self.interrupted.is_set():
+                log.info(f"[TOOL] {label} cancelled by interrupt; abandoning its thread")
+                return "interrupted", None
+            if time.monotonic() >= deadline:
+                log.warning(f"[TOOL] {label} still running after {timeout:.0f}s; abandoning its thread")
+                return "timeout", None
+            thread.join(INTERRUPT_POLL)
+        if "error" in box:
+            raise box["error"]
+        return "done", box.get("result")
+
+    @staticmethod
+    def _stop_process(proc):
+        """Terminate a child process, killing it if it ignores SIGTERM for 1s."""
+        proc.terminate()
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
     # =========================================================================
     # 4. CORE LOGIC
@@ -1896,8 +1997,27 @@ class BotGUI:
             self._ensure_tmp_dir()
             # Built after _ensure_tmp_dir, which may have moved tmp_dir
             img_path = os.path.join(self.tmp_dir, BMO_IMAGE_FILE)
-            subprocess.run(["rpicam-still", "-t", "500", "-n", "--width", "640", "--height", "480", "-o", img_path],
-                           check=True, timeout=20)
+            # Polled rather than subprocess.run(), so a spacebar interrupt
+            # stops the camera at once instead of waiting for it to finish
+            cmd = ["rpicam-still", "-t", "500", "-n", "--width", "640", "--height", "480", "-o", img_path]
+            proc = subprocess.Popen(cmd)
+            deadline = time.monotonic() + CAMERA_TIMEOUT
+            while True:
+                try:
+                    proc.wait(timeout=INTERRUPT_POLL)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if self.interrupted.is_set() or time.monotonic() >= deadline:
+                    self._stop_process(proc)
+                    # Don't leave a half-written photo behind
+                    self._remove_file(img_path)
+                    if self.interrupted.is_set():
+                        log.info("[CAMERA] Capture cancelled by interrupt")
+                        return None
+                    raise subprocess.TimeoutExpired(cmd, CAMERA_TIMEOUT)
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(proc.returncode, cmd)
             rotation = CURRENT_CONFIG["camera_rotation"]
             if rotation != 0:
                 img = Image.open(img_path)
@@ -1905,7 +2025,7 @@ class BotGUI:
                 img.save(img_path)
             return img_path
         except subprocess.TimeoutExpired:
-            log.error("Camera Error: rpicam-still timed out after 20s")
+            log.error(f"Camera Error: rpicam-still timed out after {CAMERA_TIMEOUT:.0f}s")
             return None
         except Exception as e:
             log.error(f"Camera Error: {e}")
@@ -1945,6 +2065,62 @@ class BotGUI:
                 history.append({"role": "user", "content": results})
             history.append({"role": msg["role"], "content": msg["content"]})
         return history
+
+    def _open_stream(self, client, **kwargs):
+        """Send a streaming Messages request and wait for the response to start,
+        on a helper thread, so a spacebar interrupt doesn't wait out a stalled
+        connection (up to 60s per attempt, with a retry). Returns the open
+        MessageStream, or None if interrupted first; an abandoned helper
+        closes the stream itself if it opens later. Re-raises request errors."""
+        if self.interrupted.is_set():
+            log.info("[LLM] Interrupted before the request was sent; not sending it")
+            return None
+        box = {}
+        lock = threading.Lock()
+
+        def run():
+            # Last check before anything goes on the wire: the main loop may
+            # already have given up on this helper
+            with lock:
+                if box.get("abandoned") or self.interrupted.is_set():
+                    box["abandoned"] = True
+                    return
+            try:
+                opened = client.messages.stream(**kwargs).__enter__()
+            except BaseException as e:
+                with lock:
+                    if not box.get("abandoned"):
+                        box["error"] = e
+                        return
+                log.debug(f"[LLM] Abandoned request failed: {_err_summary(e)}")
+                return
+            with lock:
+                if not box.get("abandoned"):
+                    box["stream"] = opened
+                    return
+            log.info("[LLM] Abandoned request opened late; closing it")
+            try:
+                opened.close()
+            except Exception as e:
+                log.debug(f"[LLM] Closing the abandoned stream failed: {e!r}")
+
+        thread = threading.Thread(target=run, daemon=True, name="llm-open")
+        thread.start()
+        while True:
+            thread.join(INTERRUPT_POLL)
+            with lock:
+                if "stream" in box:
+                    return box["stream"]  # the caller handles a late interrupt
+                # Before the error check: a request failure that coincides
+                # with a spacebar press is shown as the interrupt
+                if self.interrupted.is_set():
+                    box["abandoned"] = True
+                    if "error" in box:
+                        log.debug(f"[LLM] Request failed during an interrupt: {_err_summary(box['error'])}")
+                    log.info("[LLM] Request cancelled by interrupt before the response started")
+                    return None
+                if "error" in box:
+                    raise box["error"]
 
     def chat_and_respond(self, text):
         # Drain any stale items from a previous response
@@ -1999,6 +2175,8 @@ class BotGUI:
         first_chunk_sent = False
         # Set when the tool-free last round below still produced no text
         gave_up = False
+        # Set once any round got a response from the API
+        api_answered = False
 
         try:
             client = get_llm_client()
@@ -2014,46 +2192,72 @@ class BotGUI:
                 # tool_result blocks in messages when no tools are defined)
                 # but tool_choice "none" makes Claude answer in text
                 round_kwargs = {"tool_choice": {"type": "none"}} if final_round else {}
-                with client.messages.stream(
-                    model=TEXT_MODEL, messages=messages, system=SYSTEM_PROMPT,
+                stream = self._open_stream(
+                    client, model=TEXT_MODEL, messages=messages, system=SYSTEM_PROMPT,
                     tools=turn_tools, max_tokens=MAX_RESPONSE_TOKENS, **round_kwargs, **LLM_KWARGS
-                ) as stream:
-                    for content in stream.text_stream:
-                        if self.interrupted.is_set(): break
-                        if not content: continue
-                        if not round_started:
-                            round_started = True
-                            # Text after a tool result continues the same "BOT: "
-                            # line; keep it from gluing onto the text before the
-                            # tool call ("Let me check.It is...")
-                            if full_response_text and not full_response_text[-1].isspace():
-                                content = " " + content
-                        full_response_text += content
+                )
+                if stream is None:
+                    break  # interrupted before the response started
+                # The response headers arrived, so the API is reachable; set
+                # now so an interrupted reply still clears a stale startup_error
+                api_answered = True
+                # Published for handle_speaking_interrupt, which shuts it down to
+                # wake the read below; then re-check, in case the interrupt
+                # landed before the stream was published
+                self.active_stream = stream
+                try:
+                    with stream:
+                        if not self.interrupted.is_set():
+                            for content in stream.text_stream:
+                                if self.interrupted.is_set(): break
+                                if not content: continue
+                                if not round_started:
+                                    round_started = True
+                                    # Text after a tool result continues the same "BOT: "
+                                    # line; keep it from gluing onto the text before the
+                                    # tool call ("Let me check.It is...")
+                                    if full_response_text and not full_response_text[-1].isspace():
+                                        content = " " + content
+                                full_response_text += content
 
-                        self.thinking_sound_active.clear()
-                        if self.current_state != BotStates.SPEAKING:
-                            self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=self.turn_cam_path)
-                        # Tracked separately from current_state: a tool round
-                        # switches back to THINKING mid-reply, and that must
-                        # not start a second "BOT: " on the same line.
-                        if not self._bot_line_open:
-                            self.append_to_text("BOT: ", newline=False)
-                            self._bot_line_open = True
+                                self.thinking_sound_active.clear()
+                                if self.current_state != BotStates.SPEAKING:
+                                    self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=self.turn_cam_path)
+                                # Tracked separately from current_state: a tool round
+                                # switches back to THINKING mid-reply, and that must
+                                # not start a second "BOT: " on the same line.
+                                if not self._bot_line_open:
+                                    self.append_to_text("BOT: ", newline=False)
+                                    self._bot_line_open = True
 
-                        self.append_to_text(content, newline=False)
+                                self.append_to_text(content, newline=False)
 
-                        sentence_buffer += content
-                        min_len = TTS_MIN_SENTENCE_LENGTH if first_chunk_sent else TTS_FIRST_SENTENCE_MIN_LENGTH
-                        split_at = last_sentence_end(sentence_buffer)
-                        if split_at is not None and len(sentence_buffer[:split_at].strip()) >= min_len:
-                            clean_sentence = sentence_buffer[:split_at].strip()
-                            sentence_buffer = sentence_buffer[split_at:]
-                            if re.search(r'[a-zA-Z0-9]', clean_sentence):
-                                self.tts_queue.put(clean_sentence)
-                                first_chunk_sent = True
+                                sentence_buffer += content
+                                min_len = TTS_MIN_SENTENCE_LENGTH if first_chunk_sent else TTS_FIRST_SENTENCE_MIN_LENGTH
+                                split_at = last_sentence_end(sentence_buffer)
+                                if split_at is not None and len(sentence_buffer[:split_at].strip()) >= min_len:
+                                    clean_sentence = sentence_buffer[:split_at].strip()
+                                    sentence_buffer = sentence_buffer[split_at:]
+                                    if re.search(r'[a-zA-Z0-9]', clean_sentence):
+                                        self.tts_queue.put(clean_sentence)
+                                        first_chunk_sent = True
 
+                            if not self.interrupted.is_set():
+                                final_message = stream.get_final_message()
+                except Exception as e:
+                    # Shutting the socket down under a blocked read raises (an
+                    # httpx.RemoteProtocolError or ReadError); that is the
+                    # interrupt, not a failure. Any exception while interrupted
+                    # is classified this way, so log it in full at debug in
+                    # case it was a real bug in the UI/TTS code above.
                     if not self.interrupted.is_set():
-                        final_message = stream.get_final_message()
+                        raise
+                    tb = traceback.extract_tb(e.__traceback__)
+                    where = f" at {os.path.basename(tb[-1].filename)}:{tb[-1].lineno}" if tb else ""
+                    log.debug(f"[LLM] Exception during interrupted stream{where}: {_err_summary(e)}")
+                    log.info(f"[LLM] Response stream closed by interrupt ({type(e).__name__})")
+                finally:
+                    self.active_stream = None
 
                 if self.interrupted.is_set() or final_message is None:
                     break
@@ -2123,8 +2327,10 @@ class BotGUI:
                 self._start_thinking_sound()
 
             self.thinking_sound_active.clear()
-            # Claude answered, so whatever failed at warm-up has recovered
-            self.startup_error = None
+            # Claude answered, so whatever failed at warm-up has recovered (an
+            # interrupt before any reply proves nothing either way)
+            if api_answered:
+                self.startup_error = None
 
             if gave_up and not self.interrupted.is_set():
                 log.warning(f"[TOOL] No reply after {MAX_TOOL_ROUNDS} tool rounds; giving up")
