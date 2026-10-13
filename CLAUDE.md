@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Be More Agent is a single-file Python application (`agent.py`) that turns a Raspberry Pi into a conversational AI agent. It uses wake word detection, local speech-to-text (NVIDIA Parakeet via sherpa-onnx, with whisper.cpp as a fallback) and Silero voice activity detection, the Anthropic API (Claude) for LLM intelligence, and local text-to-speech (Piper TTS). An internet connection is required for the Anthropic API.
 
+The project is derived from [brenpoly/be-more-agent](https://github.com/brenpoly/be-more-agent) (MIT). The GitHub fork relationship was detached deliberately, so the README, `FORK_CHANGES.md`, `LICENSE`, the `agent.py` header and `pyproject.toml` carry the attribution; keep it when editing those files.
+
 ## Running the Project
 
 ```bash

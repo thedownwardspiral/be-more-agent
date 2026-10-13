@@ -7,6 +7,8 @@
 
 This project turns a Raspberry Pi into a fully functional, conversational AI agent. It listens for a wake word, processes speech, "thinks" using the **Anthropic API** (Claude), and speaks back with a low-latency neural voice—all while displaying reactive face animations.
 
+> **Origin:** This repository is derived from [brenpoly/be-more-agent](https://github.com/brenpoly/be-more-agent) by brenpoly (MIT License), which the demo video above shows. It has since diverged substantially (Anthropic API instead of Ollama, Parakeet speech-to-text, Silero VAD, in-process Piper and more); see [FORK_CHANGES.md](FORK_CHANGES.md) for the full list.
+
 **It is designed as a blank canvas:** You can easily swap the face images and sound effects to create your own character!
 
 ## ✨ Features
@@ -234,7 +236,7 @@ This software is a generic framework. You can give it a new personality by repla
 * **Choppy/Fragmented Speech:** If the TTS output sounds broken into tiny fragments, the `TTS_MIN_SENTENCE_LENGTH` constant in `agent.py` (default: 80 characters) controls how much text is buffered before being sent to Piper. Increase it for longer, smoother utterances. The first sentence of each reply (and the first after each tool call, such as a web search) uses the lower `TTS_FIRST_SENTENCE_MIN_LENGTH` (default: 20 characters) so the bot starts speaking sooner; raise it if a short opening sentence sounds clipped from the rest, or lower it for even faster first audio.
 
 ## 🙏 Acknowledgments
-This project is based on [be-more-agent](https://github.com/brenpoly/be-more-agent) by brenpoly, released under the MIT License. It has since diverged substantially; see [FORK_CHANGES.md](FORK_CHANGES.md) for the list of changes.
+This project is based on [be-more-agent](https://github.com/brenpoly/be-more-agent) by brenpoly, released under the MIT License (the copyright notice in [LICENSE](LICENSE) and the header of `agent.py` are theirs). It has since diverged substantially; see [FORK_CHANGES.md](FORK_CHANGES.md) for the list of changes.
 
 Speech-to-text uses [NVIDIA Parakeet-TDT 0.6B v2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) by NVIDIA, licensed under [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/), in the int8 ONNX conversion published by the [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) project (Apache-2.0), which also runs [Silero VAD](https://github.com/snakers4/silero-vad) (MIT). The model is downloaded by `setup.sh` and not redistributed in this repository.
 
