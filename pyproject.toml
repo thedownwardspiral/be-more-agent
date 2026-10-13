@@ -27,6 +27,10 @@ dependencies = [
     "sherpa-onnx-core==1.13.8",
 ]
 
+[project.urls]
+Repository = "https://github.com/thedownwardspiral/be-more-agent"
+"Original project" = "https://github.com/brenpoly/be-more-agent"
+
 # agent.py is a single top-level script, not an installable package.
 [tool.uv]
 package = false
