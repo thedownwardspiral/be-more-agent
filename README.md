@@ -19,7 +19,7 @@ This project turns a Raspberry Pi into a fully functional, conversational AI age
 * **Open Source Wake Word**: Wakes up to your custom model using **OpenWakeWord** (Offline & Free). No access keys required.
 * **Hardware-Aware Audio**: Automatically detects your microphone's sample rate and resamples audio on the fly to prevent ALSA errors. Includes an audio energy gate that skips transcription on silent/blank recordings to save CPU.
 * **Smart Web Search**: Uses DuckDuckGo to find real-time news and information when Claude doesn't know the answer.
-* **Camera Vision, On Request**: Claude can take a photo with the Pi camera and see it, but the camera is only offered on turns where you say a trigger word such as "look", "see" or "picture" (configurable via `camera_trigger_words`).
+* **Camera Vision, On Request**: Claude can take a photo with the Pi camera and see it, but the camera is only offered on turns where you ask it to look, with a phrase such as "look at this", "what do you see" or "take a picture" (configurable via `camera_trigger_words`). Everyday phrases like "look up the news" or "see you later" don't count.
 * **Reactive Faces**: The GUI updates the character's face based on its state (Listening, Thinking, Speaking, Idle).
 * **Fast Text-to-Speech**: Uses **Piper TTS** ([piper1-gpl](https://github.com/OHF-Voice/piper1-gpl)) as an in-process Python library, so the voice model stays loaded in memory — no reload delay between utterances and no separate server to manage.
 
@@ -53,7 +53,10 @@ sudo raspi-config
 
 ```text
 be-more-agent/
-├── agent.py                   # The main brain script
+├── agent.py                   # The main brain script (GUI, audio, chat loop, TTS)
+├── bmo/                       # Pure helpers used by agent.py (config, text, memory, STT chunking, tools)
+├── tests/                     # pytest suite (`uv run --group dev pytest`)
+├── .github/workflows/ci.yml   # Lint + tests on every push and pull request
 ├── setup.sh                   # Auto-installer script
 ├── start_agent.sh             # Launch script (runs agent.py via .venv)
 ├── be-more-agent.desktop      # Autostart template (installed to ~/.config/autostart/)
@@ -67,7 +70,7 @@ be-more-agent/
 ├── uv.lock                    # Locked dependency versions
 ├── models/                    # Parakeet speech-to-text (~650 MB) and Silero VAD models (downloaded by setup.sh)
 ├── whisper.cpp/               # Fallback speech-to-text engine (built by setup.sh)
-├── piper/                     # Piper TTS voice models (.onnx + .onnx.json)
+├── piper/                     # Piper TTS voice models (.onnx + .onnx.json; see "Voice" below)
 ├── sounds/                    # Sound effects folder
 │   ├── greeting_sounds/       # Startup .wav files
 │   ├── thinking_sounds/       # Looping .wav files
@@ -100,7 +103,9 @@ cd be-more-agent
 chmod +x setup.sh
 ./setup.sh
 ```
-*The setup script will install system libraries (and `uv` itself, if missing), create necessary folders, set up the `.venv` Python virtual environment via `uv sync` (including the `piper-tts` and `anthropic` SDKs and the rest of the locked dependency set from `pyproject.toml` / `uv.lock`), download a Piper voice via `python -m piper.download_voices`, download and checksum the Parakeet speech-to-text model (a ~460 MB download, ~650 MB unpacked; unpacking takes a few minutes on a Pi) and the Silero VAD model into `models/`, build whisper.cpp as the fallback engine, and install a desktop autostart entry so the agent launches with the desktop session (remove `~/.config/autostart/be-more-agent.desktop` to disable).*
+*The setup script will install system libraries (and `uv` itself, if missing), create necessary folders, set up the `.venv` Python virtual environment via `uv sync --locked` (including the `piper-tts` and `anthropic` SDKs and the rest of the locked dependency set from `pyproject.toml` / `uv.lock`), install a Piper voice (see below), download and checksum the Parakeet speech-to-text model (a ~460 MB download, ~650 MB unpacked; unpacking takes a few minutes on a Pi) and the Silero VAD model into `models/`, build whisper.cpp as the fallback engine, and install a desktop autostart entry so the agent launches with the desktop session (remove `~/.config/autostart/be-more-agent.desktop` to disable).* Every download is pinned to a fixed release or revision and checked against a SHA-256 hash before it is used; a mismatch stops the script.
+
+**Voice:** `config.json` names a BMO voice (`piper/en_US-bmo-medium.onnx`), which is not in the public Piper voice catalog, so setup can't download it. Put your own `.onnx` + `.onnx.json` pair there to use it. Without it, setup installs the stock `en_US-lessac-medium` voice and the agent falls back to it (logging a warning). To use any other voice, put its files in `piper/` and set `voice_model`.
 
 ### 3. Configure Your API Key
 ```bash
@@ -108,6 +113,8 @@ cp example.env .env
 chmod 600 .env
 ```
 Edit `.env` and set your `ANTHROPIC_API_KEY`. Get a key at [console.anthropic.com](https://console.anthropic.com/settings/keys).
+
+Anyone within earshot can talk to the agent, and every turn is a paid API call. Give it a key of its own in a workspace with a monthly spend limit (set in the Anthropic Console), so a TV left on or a chatty visitor can't run up a bill.
 
 ### 4. Configure the Wake Word
 The setup script downloads a default wake word ("Hey Jarvis"). To use your own:
@@ -161,7 +168,7 @@ You can modify the hardware behavior and personality in `config.json`:
     "whisper_threads": 3,
     "audio_energy_threshold": 0.002,
     "chat_memory": true,
-    "log_transcripts": true,
+    "log_transcripts": false,
     "camera_rotation": 0,
     "system_prompt_extras": "You are a helpful robot assistant. Keep responses short and cute.",
     "input_device": null,
@@ -176,7 +183,7 @@ Every key is optional; anything you leave out uses its default. Values are check
 | Key | Description |
 |-----|-------------|
 | `text_model` | Anthropic model name (default: `claude-haiku-5-5`; overridden by `ANTHROPIC_MODEL` env var if set) |
-| `voice_model` | Path to Piper TTS voice `.onnx` file (with sibling `.onnx.json`, as written by `python -m piper.download_voices`) |
+| `voice_model` | Path to Piper TTS voice `.onnx` file (with sibling `.onnx.json`). If the file is missing, the agent uses `piper/en_US-lessac-medium.onnx` (installed by `setup.sh`) and logs a warning |
 | `stt_engine` | Speech-to-text engine: `"parakeet"` (default; in-process, ~1 GB RAM) or `"whisper"` (whisper.cpp). If the Parakeet model is missing the agent uses whisper and says so in the status line |
 | `stt_threads` | CPU threads for Parakeet, `1`–`4` (default: `2`; more is no faster on a Pi 5) |
 | `vad_min_silence` | Seconds of silence after speech that close a speech segment, `0.2`–`3.0` (default: `0.9`). Raise it if you get cut off when you pause mid-sentence |
@@ -186,27 +193,27 @@ Every key is optional; anything you leave out uses its default. Values are check
 | `whisper_threads` | Number of CPU threads for whisper transcription (default: `3`) |
 | `audio_energy_threshold` | RMS energy below which audio is skipped without transcription (default: `0.002`) |
 | `chat_memory` | Persist the conversation to `memory.json` so it survives restarts (default: `true`). `false` never reads or writes the file; history then lasts only for the current run |
-| `log_transcripts` | Write what you said (`Heard: ...`) and what the bot said (`[PIPER SPEAKING] ...`, web search queries) to `agent.log` (default: `true`). `false` still logs those lines, but as `<redacted, N chars>` |
+| `log_transcripts` | Write what you said (`Heard: ...`) and what the bot said (`[PIPER SPEAKING] ...`, web search queries) to `agent.log` (default: `false`, which still logs those lines, but as `<redacted, N chars>`). Turn it on while debugging |
 | `camera_rotation` | Rotate camera image (0, 90, 180, 270) |
 | `system_prompt_extras` | Extra personality instructions appended to the system prompt |
 | `input_device` | Microphone to use — a device index, a name substring (e.g. `"USB"`), or `null` for the system default |
 | `input_sample_rate` | Preferred mic sample rate; the agent verifies it and falls back through 48000/44100/32000/16000 |
-| `max_history_messages` | Most recent chat messages resent to Claude each turn (default: `20`, minimum `2`) |
+| `max_history_messages` | Most recent chat messages resent to Claude each turn, and kept in `memory.json` across restarts (default: `20`, minimum `2`) |
 | `silence_threshold` | Only used if the Silero VAD model is missing: minimum volume that counts as speech while recording; the agent also adapts to the room's noise floor (default: `0.006`) |
 | `wake_word_threshold` | Wake-word score needed to trigger, above 0 and at most 1 (default: `0.5`) |
 | `wake_word_consecutive` | Consecutive 80 ms frames that must clear `wake_word_threshold` (default: `1`) |
-| `camera_trigger_words` | Words/phrases that offer the camera tool to Claude on that turn (whole words; case and punctuation ignored). Default includes "look", "see", "picture", "photo", "camera", "what is this". `[]` disables the camera entirely |
+| `camera_trigger_words` | Words/phrases that offer the camera tool to Claude on that turn (whole words; case and punctuation ignored). The default is phrases such as "look at", "what do you see", "can you see", "take a look", plus "photo", "picture", "selfie", "camera", "what is this". Prefer phrases over bare "look"/"see", which also match "look up the news" and "see you later". `[]` disables the camera entirely |
 | `temperature` | Sampling temperature, `0.0`–`1.0` (default: `null`, which leaves it out so the model's default applies) |
 | `effort` | Thinking effort: `"low"`, `"medium"` or `"high"` (default: `"low"`). `null` means not sent |
 
-If you change `text_model` (or set `ANTHROPIC_MODEL` in `.env`, which overrides it), the `temperature`/`effort` keys must suit the model you choose; a mismatch fails at startup with "Can't reach Claude" (see Troubleshooting).
+If you change `text_model` (or set `ANTHROPIC_MODEL` in `.env`, which overrides it), the `temperature`/`effort` keys must suit the model you choose; a mismatch fails at startup with "Claude rejected the request" (see Troubleshooting).
 
 ### Privacy & files
 
 * The conversation can end up in two places, each with its own switch:
-  * `memory.json` holds the recent conversation (the last 10 messages) so it survives restarts, including each reply's tool calls (tool inputs such as search queries and up to 600 chars of tool results; never image data). Controlled by `chat_memory`; with `"chat_memory": false` it is never read or written.
-  * `agent.log` records each turn's transcript (`Heard: ...`, `[PIPER SPEAKING] ...`, web search queries) alongside the runtime log. It is rotated at 1 MB with 3 backups (`agent.log.1`–`.3`). Controlled by `log_transcripts`; with `"log_transcripts": false` those lines are still written but logged as `<redacted, N chars>`, so you can see activity without content. Turning `chat_memory` off does **not** stop these log lines; set both to `false` to keep no transcript on disk.
-* `memory.json`, `agent.log` and its backups, plus `.env`, are kept at mode 600 (owner only) by the agent at startup and by `setup.sh`.
+  * `memory.json` holds the recent conversation (the last `max_history_messages`, 20 by default) so it survives restarts, including a record of each reply's tool calls: the tool inputs, such as search queries, and short results such as the time or an error. Web page text from searches and camera images are never stored. Controlled by `chat_memory`; with `"chat_memory": false` it is never read or written.
+  * `agent.log` records each turn's transcript (`Heard: ...`, `[PIPER SPEAKING] ...`, web search queries) alongside the runtime log. It is rotated at 1 MB with 3 backups (`agent.log.1`–`.3`). Controlled by `log_transcripts`, off by default: those lines are then logged as `<redacted, N chars>`, so you can see activity without content. Set it to `true` to log the words. Turning `chat_memory` off does **not** affect these log lines; with both at `false`, no transcript is kept on disk.
+* `memory.json`, `agent.log` and its backups (and any renamed `agent.log*` copy), plus `.env`, are kept at mode 600 (owner only) by the agent at startup and by `setup.sh`.
 * Voice recordings stay in memory with Parakeet. With the whisper fallback, and for camera photos, they are written to a private temporary directory and deleted as soon as they have been used (and the directory is removed at exit; one left behind by a crash or power loss is removed on the next start).
 * Say "forget everything" or "reset memory" (a short lead-in like "okay" or the wake word is fine) to wipe the stored conversation. This clears the bot's memory and `memory.json` (deleting the file if `chat_memory` is off), but does **not** purge transcripts already written to `agent.log`; delete `agent.log*` yourself for that. The whole utterance must be the command, so a sentence that merely contains the phrase does nothing.
 
@@ -226,14 +233,29 @@ This software is a generic framework. You can give it a new personality by repla
 * **`couldn't connect to display ":0"` error:** The Pi must be running a desktop environment (X11 or Wayland). If you installed Raspberry Pi OS Lite (server/headless), you need to install `lightdm` and configure desktop autologin via `sudo raspi-config` — see [Display Requirements](#️-display-requirements). If running over SSH, ensure the desktop is already active on the Pi. You can override the target display with `DISPLAY=:1 python agent.py` if needed.
 * **"AuthenticationError" or API key errors:** Ensure your `.env` file exists and contains a valid `ANTHROPIC_API_KEY`. Copy from `example.env` if needed.
 * **`[CONFIG]` warnings at startup:** Config problems are reported in the console and `agent.log` when the agent starts. A bad value or unknown key is skipped (its default is used); if `config.json` is not valid JSON, the **whole file is ignored** with a loud error banner and every setting is at its default, so fix the syntax and restart.
-* **Startup shows "Can't reach Claude: check API key / network":** The warm-up request failed. Check `ANTHROPIC_API_KEY` in `.env`, the network connection, and that the `temperature`/`effort` keys suit `text_model`. The exact API error is in `agent.log`.
+* **Startup (or a turn) shows a Claude error:** The status line names the cause, and the exact API error is in `agent.log`:
+  * "No API key" / "Claude rejected the API key": set a valid `ANTHROPIC_API_KEY` in `.env`.
+  * "Unknown model ...": fix `text_model` (or `ANTHROPIC_MODEL` in `.env`).
+  * "Claude rejected the request": the `temperature`/`effort` keys don't suit the model. For example, older models such as `claude-haiku-4-5` reject `effort`, so set it to `null`.
+  * "Claude is rate limiting" / "Claude is having trouble": wait and try again; a spend limit you've reached also shows up here.
+  * "Can't reach Claude: check the network": the Pi can't connect to the API.
 * **Status shows "Parakeet unavailable: using whisper" (or `[STT] ERROR` / `[VAD] Silero VAD unavailable` in `agent.log`):** The speech models in `models/` are missing or `sherpa-onnx` is not installed. Run `uv sync`, then re-run `./setup.sh` (step 5 downloads `models/parakeet-tdt-0.6b-v2-int8/` and `models/silero_vad.onnx`, verifying their checksums), and restart the agent. Until then it transcribes with whisper.cpp and ends recordings on a 1.5 s silence. Each transcription logs its time as `[STT] parakeet 0.43s` so you can compare engines.
 * **Cut off mid-sentence, or the agent waits too long after you finish:** Wake-word recordings end `vad_min_silence` + `vad_resume_window` seconds (default 0.9 + 0.6) after your last word; `agent.log` shows `[VAD] Speech ... stopped at ...` and `[VAD] Speech resumed` when a pause was bridged. Raise `vad_min_silence` if long pauses still cut you off; lower `vad_resume_window` (or `vad_min_silence`) if turns feel slow.
 * **Push-to-talk stopped on its own:** A push-to-talk recording ends after 60 seconds even if you don't press Enter again (`[PTT] Max recording length reached (60 s)` in `agent.log`); what was recorded is transcribed as usual. Press Enter to start a new one.
 * **"No search library found":** If web search fails, ensure you are in the `.venv` virtual environment and `ddgs` is installed (`uv sync`).
 * **Shutdown Errors:** When you exit the script (Ctrl+C), you might see `Expression 'alsa_snd_pcm_mmap_begin' failed`. **This is normal.** It just means the audio stream was cut off mid-sample. It does not affect the functionality.
-* **Audio Glitches:** If the voice sounds fast or slow, the script attempts to auto-detect sample rates. Ensure your `config.json` points to a valid `.onnx` voice model in the `piper/` folder (with its sibling `.onnx.json` next to it). To switch voices, run `uv run python -m piper.download_voices --data-dir piper <voice-name>`.
+* **Audio Glitches:** If the voice sounds fast or slow, the script attempts to auto-detect sample rates. Ensure your `config.json` points to a valid `.onnx` voice model in the `piper/` folder (with its sibling `.onnx.json` next to it). To switch to a catalog voice, run `uv run python -m piper.download_voices --data-dir piper <voice-name>` and set `voice_model`.
+* **"Sorry, I can't help with that one.":** Claude declined the request (`stop_reason=refusal` in `agent.log`). "That one was too much for me" means the reply ran out of tokens before saying anything.
 * **Choppy/Fragmented Speech:** If the TTS output sounds broken into tiny fragments, the `TTS_MIN_SENTENCE_LENGTH` constant in `agent.py` (default: 80 characters) controls how much text is buffered before being sent to Piper. Increase it for longer, smoother utterances. The first sentence of each reply (and the first after each tool call, such as a web search) uses the lower `TTS_FIRST_SENTENCE_MIN_LENGTH` (default: 20 characters) so the bot starts speaking sooner; raise it if a short opening sentence sounds clipped from the rest, or lower it for even faster first audio.
+
+## 🧪 Development
+
+```bash
+uv run --group dev pytest            # tests (the dev group isn't installed by setup.sh)
+uvx ruff check agent.py bmo tests    # lint
+```
+
+`bmo/` holds the logic that needs no audio device, GUI or network, so it is tested directly; `tests/test_turn.py` drives a whole chat turn against a fake Claude client. CI (`.github/workflows/ci.yml`) runs both on every push to `main` and every pull request. `start_agent.sh` runs `uv sync --frozen` before launching, so a `git pull` that adds a dependency takes effect on the next start.
 
 ## 🙏 Acknowledgments
 This project is based on [be-more-agent](https://github.com/brenpoly/be-more-agent) by brenpoly, released under the MIT License (the copyright notice in [LICENSE](LICENSE) and the header of `agent.py` are theirs). It has since diverged substantially; see [FORK_CHANGES.md](FORK_CHANGES.md) for the list of changes.

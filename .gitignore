@@ -31,8 +31,8 @@ models/
 # llama-swap binary
 llama-swap
 
-# Exception: Un-comment the line below if you WANT to share your custom wake word
-# !wakeword.onnx
+# Exception: the repo ships its wake word model (it is tracked)
+!wakeword.onnx
 
 # --- User Configuration & Memory ---
 # Claude Code per-project memory and session state (local working notes,
@@ -54,6 +54,8 @@ chat_memory.json
 *.mp3
 *.jpg
 *.png
+# Exception: the face images are part of the repo; new ones need no `git add -f`
+!faces/**/*.png
 camera_capture.jpg
 current_image.jpg
 test_audio.wav
