@@ -20,7 +20,7 @@ The Pi usually has an agent already running from the main checkout (autostart). 
 
 - `agent.py`: the `BotGUI` class: GUI, recording, STT, the chat/tool loop and the TTS threads, plus the config-derived module constants. Its preamble sets `DISPLAY`, `chdir`s to the repo and configures logging before the GUI/audio imports; that order is why ruff's E402 is ignored for it.
 - `bmo/`: pure helpers with no import-time side effects: `config` (defaults, validation), `text` (sentence splitting, TTS normalization, trigger and wipe regexes, transcript filters), `memory` (tool records, memory.json validation and upgrade, history rendering), `stt` (resampling, chunk split points), `tools` (tool schemas, `get_time` and search output), `llm` (status text for API errors, stop-reason fallbacks). New logic that needs no device or thread belongs here, with a test.
-- `tests/`: pytest for `bmo/`, plus `test_turn.py`, which drives `chat_and_respond` with a fake Claude client.
+- `tests/`: pytest for `bmo/`, plus `test_turn.py`, which drives `chat_and_respond` with a fake Claude client. `conftest.py` sets `BMO_CONFIG_FILE` and `BMO_LOG_FILE` empty before `agent` is imported, so the tests run on `DEFAULT_CONFIG` and never open the running agent's `agent.log`.
 - `setup.sh`: every download goes through `download_verified` (pinned URL + SHA-256). Change the hash together with the URL.
 
 ## Threading rules

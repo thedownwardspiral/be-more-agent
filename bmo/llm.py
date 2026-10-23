@@ -40,7 +40,8 @@ TRUNCATED_REPLY = "Hmm, that one was too much for me. Can you ask a shorter way?
 def stop_reason_reply(stop_reason, produced_text):
     """What to add to a reply after the final message of a round, or None.
     A refusal always gets the apology, since a mid-reply refusal cuts the text
-    off; a max_tokens stop only when nothing was said."""
+    off; a max_tokens stop only when produced_text is false (that round said
+    nothing)."""
     if stop_reason == "refusal":
         return REFUSAL_REPLY
     if stop_reason == "max_tokens" and not produced_text:

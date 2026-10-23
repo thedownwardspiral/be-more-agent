@@ -1,7 +1,9 @@
 """chat_and_respond driven by a fake Claude client: no audio, GUI or network.
 
 Importing agent.py loads its GUI/audio libraries (tkinter, sounddevice,
-openwakeword, piper) but creates no window and opens no device.
+openwakeword, piper) but creates no window and opens no device. A failed import
+is an error, not a skip: it is what a broken bmo/ import looks like. conftest.py
+keeps the import away from the repo's config.json and agent.log.
 """
 import queue
 import threading
@@ -9,12 +11,11 @@ from types import SimpleNamespace
 
 import anthropic
 import httpx
-import pytest
 
-agent = pytest.importorskip("agent")
-
-from bmo.llm import REFUSAL_REPLY  # noqa: E402
-from bmo.memory import SEARCH_NOT_RETAINED  # noqa: E402
+import agent
+from bmo.config import DEFAULT_CONFIG
+from bmo.llm import REFUSAL_REPLY, TRUNCATED_REPLY
+from bmo.memory import SEARCH_NOT_RETAINED
 
 
 def text_block(text):
@@ -162,3 +163,40 @@ def test_api_errors_say_what_to_fix(monkeypatch):
     state, msg = bot.states[-1]
     assert state == agent.BotStates.ERROR and "rejected the API key" in msg
     assert bot.session_memory == []
+
+
+def test_import_ignores_the_local_config_and_log():
+    assert agent.CURRENT_CONFIG == DEFAULT_CONFIG
+    assert not any(isinstance(h, agent._PrivateRotatingFileHandler)
+                   for h in agent.logging.getLogger().handlers)
+
+
+def test_max_tokens_after_a_tool_round_is_not_silent(monkeypatch):
+    # "Let me look that up." came from the round before the tool call; the
+    # round after it ran out of tokens before saying anything
+    bot, _ = make_bot(
+        monkeypatch,
+        [FakeStream(["Let me look that up."], "tool_use",
+                    [text_block("Let me look that up."), tool_block("toolu_1", "get_time", {})]),
+         FakeStream([], "max_tokens", [])],
+        tool_results={"get_time": ("It is noon.", False)})
+    bot.chat_and_respond("what time is it?")
+    assert spoken(bot) == ["Let me look that up.", TRUNCATED_REPLY]
+    assert bot.session_memory[-1]["content"] == "Let me look that up. " + TRUNCATED_REPLY
+
+
+def test_turn_api_error_beats_a_stale_startup_error(monkeypatch):
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    limit = anthropic.RateLimitError("slow down", response=httpx.Response(429, request=request), body=None)
+    bot, _ = make_bot(monkeypatch, [limit])
+    bot.startup_error = "Can't reach Claude: check the network"
+    bot.chat_and_respond("hi")
+    state, msg = bot.states[-1]
+    assert state == agent.BotStates.ERROR and "rate limiting" in msg
+
+
+def test_non_api_error_keeps_the_startup_error(monkeypatch):
+    bot, _ = make_bot(monkeypatch, [RuntimeError("bug")])
+    bot.startup_error = "Can't reach Claude: check the network"
+    bot.chat_and_respond("hi")
+    assert bot.states[-1] == (agent.BotStates.ERROR, "Can't reach Claude: check the network")

@@ -44,15 +44,19 @@ class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
         return os.fdopen(fd, self.mode, encoding=self.encoding, errors=self.errors)
 
 LOG_BACKUP_COUNT = 3  # agent.log.1 .. agent.log.3
+# BMO_LOG_FILE overrides the log path; empty means stdout only. The tests set it
+# empty, so importing agent.py never touches a running agent's log.
+LOG_FILE = os.environ.get("BMO_LOG_FILE", str(BASE_DIR / "agent.log"))
 
 def _setup_logging():
     handlers = [logging.StreamHandler(sys.stdout)]
     file_error = None
-    try:
-        handlers.append(_PrivateRotatingFileHandler(
-            BASE_DIR / "agent.log", maxBytes=1_000_000, backupCount=LOG_BACKUP_COUNT, encoding="utf-8"))
-    except OSError as e:
-        file_error = e
+    if LOG_FILE:
+        try:
+            handlers.append(_PrivateRotatingFileHandler(
+                LOG_FILE, maxBytes=1_000_000, backupCount=LOG_BACKUP_COUNT, encoding="utf-8"))
+        except OSError as e:
+            file_error = e
     # Root at WARNING so library warnings land in the log too, without the
     # per-request INFO chatter from httpx/anthropic; our own logger is INFO.
     logging.basicConfig(level=logging.WARNING, handlers=handlers,
@@ -120,7 +124,7 @@ load_dotenv(BASE_DIR / ".env")
 from ddgs import DDGS
 
 # Pure helpers (no side effects at import; covered by tests/)
-from bmo.config import load_config
+from bmo.config import CONFIG_FILE, load_config
 from bmo.llm import MissingAPIKeyError, describe_api_error, stop_reason_reply
 from bmo.memory import (conversation_tail, history_messages, is_valid_memory,
                         make_tool_record, upgrade_memory)
@@ -163,7 +167,9 @@ TTS_MIN_SENTENCE_LENGTH = 80
 # TTS_MIN_SENTENCE_LENGTH to avoid choppy fragments.
 TTS_FIRST_SENTENCE_MIN_LENGTH = 20
 
-CURRENT_CONFIG = load_config()
+# BMO_CONFIG_FILE overrides config.json; empty means every setting at its
+# default (the tests set it empty, so a local config.json can't change them)
+CURRENT_CONFIG = load_config(os.environ.get("BMO_CONFIG_FILE", CONFIG_FILE))
 TEXT_MODEL = os.environ.get("ANTHROPIC_MODEL", CURRENT_CONFIG["text_model"])
 WAKE_WORD_THRESHOLD = CURRENT_CONFIG["wake_word_threshold"]
 WAKE_WORD_CONSECUTIVE = CURRENT_CONFIG["wake_word_consecutive"]
@@ -1183,7 +1189,8 @@ class BotGUI:
             # Make the failure visible and audible instead of greeting as if all
             # is well. The main loop still starts, so PTT keeps working; the
             # message stays in the status line (and replaces "Brain Freeze!" on
-            # a failed turn) until a turn succeeds. describe_api_error tells a
+            # a turn that fails without an API error of its own) until a turn
+            # succeeds. describe_api_error tells a
             # bad key, model or parameter apart from a network failure.
             self.startup_error = describe_api_error(e, TEXT_MODEL)
             self.set_state(BotStates.ERROR, self.startup_error)
@@ -1962,9 +1969,10 @@ class BotGUI:
                     first_chunk_sent = True
 
                 # A refusal or an exhausted max_tokens is not a reply the user
-                # can use; without this the bot would go quiet and show "Ready"
-                fallback_reply = stop_reason_reply(final_message.stop_reason,
-                                                   bool(full_response_text.strip()))
+                # can use; without this the bot would go quiet and show "Ready".
+                # Only this round's text counts: "Let me look that up." before
+                # a tool call is not an answer.
+                fallback_reply = stop_reason_reply(final_message.stop_reason, round_started)
                 if fallback_reply:
                     log.warning(f"[LLM] Response ended with stop_reason={final_message.stop_reason}")
                     break
@@ -2070,11 +2078,12 @@ class BotGUI:
             # or the bot records and answers its own voice
             self.wait_for_tts()
             self.interrupted.clear()
-            # An API error says what to fix (key, model, rate limit, network);
+            # An API error says what to fix (key, model, rate limit, network),
+            # and this turn's cause beats a warm-up failure that may be stale;
             # anything else is a bug, logged above
             message = describe_api_error(e, TEXT_MODEL) if isinstance(
                 e, (anthropic.AnthropicError, MissingAPIKeyError)) else None
-            self.set_state(BotStates.ERROR, self.startup_error or message or "Brain Freeze!")
+            self.set_state(BotStates.ERROR, message or self.startup_error or "Brain Freeze!")
 
         # Finish the reply's line on every exit path (done, interrupted, error)
         # so the next "YOU:" starts on a line of its own.
