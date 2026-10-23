@@ -13,7 +13,10 @@ dependencies = [
     # pin the boundary explicitly. Revisit if tflite-runtime ships cp313 wheels.
     "openwakeword<0.5",
     "onnxruntime",
-    "anthropic",
+    # agent.py's interrupt path reaches into the 0.x SDK's httpx stream
+    # (response.extensions["network_stream"]); 1.x moves to httpx2. Upgrade
+    # across the major version deliberately, not via a routine `uv lock --upgrade`.
+    "anthropic>=0.120,<1",
     "python-dotenv",
     "ddgs",
     "Pillow",
@@ -31,16 +34,23 @@ dependencies = [
 Repository = "https://github.com/thedownwardspiral/be-more-agent"
 "Original project" = "https://github.com/brenpoly/be-more-agent"
 
-# agent.py is a single top-level script, not an installable package.
+[dependency-groups]
+# Not installed by setup.sh or start_agent.sh (see default-groups below).
+# Run the tests with `uv run --group dev pytest`.
+dev = ["pytest>=8"]
+
+# agent.py is a top-level script plus the bmo/ helper package next to it, not
+# an installable package.
 [tool.uv]
 package = false
+default-groups = []
 
 # The GUI needs tkinter, which comes from the apt package python3-tk installed by
 # setup.sh — that only equips the system interpreter. Forbid uv from silently
 # downloading a managed CPython, which would build a .venv with no working Tk.
 python-preference = "only-system"
 
-# Lint with `uvx ruff check agent.py` (ruff is not a project dependency).
+# Lint with `uvx ruff check agent.py bmo tests` (ruff is not a project dependency).
 [tool.ruff]
 line-length = 120
 target-version = "py311"
@@ -49,3 +59,7 @@ target-version = "py311"
 select = ["E4", "E7", "E9", "F"]
 # Import order in agent.py is deliberate: DISPLAY, chdir and logging must run before the GUI/audio imports.
 per-file-ignores = { "agent.py" = ["E402"] }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

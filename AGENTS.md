@@ -1,9 +1,9 @@
 # AGENTS.md
 
-Agent instructions for this repository live in [CLAUDE.md](CLAUDE.md). Read it before making changes; it is kept current and this file is not.
+Agent instructions for this repository live in [CLAUDE.md](CLAUDE.md): read it before making changes.
 
-Rules to know before touching the repo:
+The rules that matter most:
 
-- It is a single-file app: everything is in `agent.py` (one `BotGUI` class). Keep it that way unless asked otherwise.
-- There are no tests. Check changes with `uvx ruff check agent.py` and `python3 -m py_compile agent.py`.
-- Never commit `.env`, `memory.json` or `agent.log*`: they hold the API key and conversation transcripts.
+- Pure logic goes in `bmo/` with a test; `agent.py` holds the GUI, audio and thread code.
+- Check changes with `uv run --group dev pytest` and `uvx ruff check agent.py bmo tests`.
+- `.env`, `memory.json` and `agent.log*` hold the API key and conversation transcripts: they stay out of git.

@@ -596,3 +596,75 @@ Claude; the turn ends through the usual path (no memory save, TTS drained,
   instead of letting the bot answer it anyway (e.g. after the 60 s cap).
   The check runs before the decode too, so a spacebar during the cap's ack
   sound skips it, and the cap's "That's all I can hold!" is not overwritten.
+
+## Second Review: Privacy, Setup, Tests
+
+### Security and privacy
+
+- **Camera triggers are phrases.** The default `camera_trigger_words` were
+  bare words ("see", "look", "view"), which matched "look up the news",
+  "let's see", "see you later" and "looks like rain". On exactly the turns
+  that also search, text planted in a result could then ask for a photo.
+  The defaults are now phrases ("look at", "what do you see", "can you see",
+  "take a picture", ...), and the system prompt says search results are
+  information, not instructions.
+- **Web text is not saved.** A search's tool record in `memory.json` used to
+  keep up to 600 chars of the result, which was resent to Claude every turn,
+  across restarts. It now stores `search results used for the reply below
+  (web text not retained)`; the saved reply already says what was found.
+  Older files are scrubbed on load (`upgrade_memory`, logged once).
+- **`log_transcripts` defaults to false.** `agent.log` records activity,
+  not words, unless you turn it on.
+- **Private files by glob.** The startup chmod covers every `agent.log*`
+  (including renamed copies) and `memory.json.tmp`, not just the numbered
+  backups.
+- **Downloads are pinned and verified.** The uv installer (0.11.32), the
+  whisper `base.en` model and the stock Piper voice are fetched from fixed
+  revisions and checked against SHA-256 hashes, like the Parakeet, VAD and
+  wake-word models already were (`download_verified` in `setup.sh`).
+- **`anthropic` is pinned below 1.0**, since the interrupt path reads the
+  0.x SDK's httpx stream internals.
+
+### Functionality
+
+- **`get_time` includes the date**: "It is 3:05 PM on Wednesday, October 21,
+  2026 (PDT)." Before, "what day is it?" had no source.
+- **Memory keeps `max_history_messages` entries** (20 by default) instead of
+  a hard-coded 10, so a restart no longer halves what Claude remembers.
+- **Refusals and empty `max_tokens` stops are spoken.** A `refusal` used to
+  end the turn silently on "Ready"; the bot now says "Sorry, I can't help
+  with that one." (and "Hmm, that one was too much for me..." when the token
+  cap ran out before any text). Both are saved with the reply.
+- **API errors name the cause** on the face, at startup and on a failed
+  turn: a missing or rejected key, an unknown model, a rejected parameter
+  (e.g. `effort` on a model without it), rate limiting, server trouble, or
+  the network. Before, every failure read "check API key / network".
+- **Search returns the top 3 results** (title, date, 250-char snippet)
+  instead of one 300-char snippet.
+- **Fresh installs get a voice.** `setup.sh` asked Piper's downloader for
+  `en_US-bmo-medium`, which is not in the Piper catalog, so a fresh setup
+  stopped at step 4. It now keeps a BMO voice you supply in `piper/`, and
+  otherwise installs `en_US-lessac-medium`, which the agent falls back to
+  when `voice_model` is missing.
+- **Launch**: `start_agent.sh` runs `uv sync --frozen` first (and starts on
+  the existing `.venv` if that fails), so new dependencies take effect after
+  a pull. The autostart entry quotes its `Exec` path and no longer opens a
+  terminal; `setup.sh` refuses repo paths with characters that would break
+  the entry.
+
+### Code quality
+
+- **`bmo/` package**: config validation, text handling, memory records, STT
+  chunking, tool output and API error text moved out of `agent.py` into
+  modules with no import-time side effects.
+- **Tests and CI**: a pytest suite covers `bmo/` and drives
+  `chat_and_respond` with a fake Claude client (camera gating, refusals,
+  saved tool records, error messages). GitHub Actions runs ruff, a syntax
+  check and the tests on every push to `main` and every pull request.
+  `pytest` lives in a `dev` dependency group that `setup.sh` doesn't install.
+- **Smaller cleanups**: `BotStates` is a `StrEnum`; `INPUT_DEVICE_NAME`
+  (an index) is now `INPUT_DEVICE`; a verified input sample rate is cached
+  and re-probed after a stream error; ruff's E701 one-liners are gone; the
+  tracked face images and `wakeword.onnx` are exempt from the `*.png` /
+  `*.onnx` ignore rules; `CLAUDE.md` is down to the architecture and the
+  threading rules, and `AGENTS.md` points at it.

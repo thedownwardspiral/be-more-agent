@@ -18,11 +18,47 @@ PARAKEET_DIR="models/parakeet-tdt-0.6b-v2-int8"                    # where agent
 SILERO_VAD_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
 SILERO_VAD_SHA256="9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
 
+# whisper.cpp base.en model (fallback STT), from a pinned revision of the model repo
+WHISPER_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.en.bin"
+WHISPER_MODEL_SHA256="a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002"
+
+# Piper voice. The BMO voice that config.json names (piper/en_US-bmo-medium.onnx)
+# is not in the Piper voice catalog, so it can't be downloaded: put your own
+# copy in piper/. Without it, this stock voice is installed and the agent uses it.
+VOICE_NAME="en_US-lessac-medium"
+VOICE_BASE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/5041a7a49ae5b3a0f30e6837769eb03fdbb231bd/en/en_US/lessac/medium"
+VOICE_ONNX_SHA256="5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f"
+VOICE_JSON_SHA256="efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da181dab690a0"
+CUSTOM_VOICE="piper/en_US-bmo-medium.onnx"
+
+# uv, if it isn't installed: a pinned installer release, checked before it runs
+UV_VERSION="0.11.32"
+UV_INSTALLER_URL="https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-installer.sh"
+UV_INSTALLER_SHA256="43aff33a967fe40e8c17949d8c85c65bc43f3b5c94742393c957f56ab5ba80f4"
+
 # Define colors for output
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
+
+# download_verified URL DEST SHA256 LABEL: download to DEST.tmp, check the
+# SHA-256, then move it into place. Exits the script on any failure, so no
+# unverified file is ever left at DEST.
+download_verified() {
+    local url="$1" dest="$2" sha="$3" label="$4"
+    if ! curl -fL -o "$dest.tmp" "$url"; then
+        rm -f "$dest.tmp"
+        echo -e "${RED}❌ Failed to download $label from $url${NC}"
+        exit 1
+    fi
+    if ! echo "$sha  $dest.tmp" | sha256sum -c --quiet; then
+        rm -f "$dest.tmp"
+        echo -e "${RED}❌ $label checksum mismatch; refusing to install it.${NC}"
+        exit 1
+    fi
+    mv "$dest.tmp" "$dest"
+}
 
 echo -e "${GREEN}🤖 Pi Local Assistant Setup Script${NC}"
 
@@ -67,17 +103,33 @@ mkdir -p faces/warmup
 # 3. Install Python Libraries (Piper TTS now ships as a Python wheel)
 echo -e "${YELLOW}[3/10] Installing Python Libraries (uv)...${NC}"
 if ! command -v uv &>/dev/null; then
-    echo -e "${YELLOW}Installing uv...${NC}"
-    curl -LsSf https://astral.sh/uv/install.sh | sh
+    echo -e "${YELLOW}Installing uv ${UV_VERSION}...${NC}"
+    UV_INSTALLER="$(mktemp)"
+    download_verified "$UV_INSTALLER_URL" "$UV_INSTALLER" "$UV_INSTALLER_SHA256" "the uv installer"
+    sh "$UV_INSTALLER"
+    rm -f "$UV_INSTALLER"
     # The installer drops uv in ~/.local/bin, which may not be on PATH yet.
     export PATH="$HOME/.local/bin:$PATH"
 fi
-# Creates .venv/ and installs the locked dependency set from uv.lock.
-uv sync
+# Creates .venv/ and installs the locked dependency set from uv.lock (without
+# the dev group: tests are run with `uv run --group dev pytest`).
+uv sync --locked
 
-# 4. Download Voice Model via piper1-gpl's downloader
-echo -e "${YELLOW}[4/10] Downloading Voice Model...${NC}"
-uv run python -m piper.download_voices --data-dir piper en_US-bmo-medium
+# 4. Voice model
+echo -e "${YELLOW}[4/10] Checking Voice Model...${NC}"
+if [ -f "$CUSTOM_VOICE" ] && [ -f "$CUSTOM_VOICE.json" ]; then
+    echo -e "${GREEN}Custom voice $CUSTOM_VOICE found.${NC}"
+elif [ -f "piper/$VOICE_NAME.onnx" ] && [ -f "piper/$VOICE_NAME.onnx.json" ]; then
+    echo -e "${GREEN}Stock voice $VOICE_NAME already present.${NC}"
+else
+    echo -e "${YELLOW}No $CUSTOM_VOICE; installing the stock voice $VOICE_NAME (~63 MB)...${NC}"
+    download_verified "$VOICE_BASE_URL/$VOICE_NAME.onnx?download=true" "piper/$VOICE_NAME.onnx" \
+        "$VOICE_ONNX_SHA256" "the $VOICE_NAME voice"
+    download_verified "$VOICE_BASE_URL/$VOICE_NAME.onnx.json?download=true" "piper/$VOICE_NAME.onnx.json" \
+        "$VOICE_JSON_SHA256" "the $VOICE_NAME voice config"
+    echo -e "${YELLOW}   The agent uses it while $CUSTOM_VOICE is missing. To use another voice, put its${NC}"
+    echo -e "${YELLOW}   .onnx and .onnx.json in piper/ and set voice_model in config.json.${NC}"
+fi
 
 # 5. Speech-to-text and voice activity models (Parakeet + Silero VAD)
 echo -e "${YELLOW}[5/10] Downloading speech-to-text models...${NC}"
@@ -87,38 +139,19 @@ if [ -f "$PARAKEET_DIR/encoder.int8.onnx" ] && [ -f "$PARAKEET_DIR/decoder.int8.
     echo -e "${GREEN}Parakeet model already present.${NC}"
 else
     echo -e "${YELLOW}Downloading Parakeet-TDT 0.6B v2 int8 (~460 MB, ~650 MB unpacked)...${NC}"
-    if ! curl -fL -o models/parakeet.tar.bz2.tmp "$PARAKEET_URL"; then
-        rm -f models/parakeet.tar.bz2.tmp
-        echo -e "${RED}❌ Failed to download the Parakeet model from $PARAKEET_URL${NC}"
-        exit 1
-    fi
-    if ! echo "$PARAKEET_SHA256  models/parakeet.tar.bz2.tmp" | sha256sum -c --quiet; then
-        rm -f models/parakeet.tar.bz2.tmp
-        echo -e "${RED}❌ Parakeet model checksum mismatch; refusing to install it.${NC}"
-        exit 1
-    fi
+    download_verified "$PARAKEET_URL" models/parakeet.tar.bz2 "$PARAKEET_SHA256" "the Parakeet model"
     echo -e "${YELLOW}Unpacking (takes a few minutes on a Pi)...${NC}"
     # Unpack into a scratch dir, then move into place, so an interrupted run
     # never leaves a half-extracted model at the path agent.py checks
     rm -rf models/.parakeet-extract
     mkdir -p models/.parakeet-extract
-    tar -xjf models/parakeet.tar.bz2.tmp -C models/.parakeet-extract
+    tar -xjf models/parakeet.tar.bz2 -C models/.parakeet-extract
     rm -rf "$PARAKEET_DIR"
     mv "models/.parakeet-extract/$PARAKEET_ARCHIVE_DIR" "$PARAKEET_DIR"
-    rm -rf models/.parakeet-extract models/parakeet.tar.bz2.tmp "$PARAKEET_DIR/test_wavs"
+    rm -rf models/.parakeet-extract models/parakeet.tar.bz2 "$PARAKEET_DIR/test_wavs"
 fi
 if [ ! -f "models/silero_vad.onnx" ]; then
-    if ! curl -fL -o models/silero_vad.onnx.tmp "$SILERO_VAD_URL"; then
-        rm -f models/silero_vad.onnx.tmp
-        echo -e "${RED}❌ Failed to download the Silero VAD model from $SILERO_VAD_URL${NC}"
-        exit 1
-    fi
-    if ! echo "$SILERO_VAD_SHA256  models/silero_vad.onnx.tmp" | sha256sum -c --quiet; then
-        rm -f models/silero_vad.onnx.tmp
-        echo -e "${RED}❌ Silero VAD model checksum mismatch; refusing to install it.${NC}"
-        exit 1
-    fi
-    mv models/silero_vad.onnx.tmp models/silero_vad.onnx
+    download_verified "$SILERO_VAD_URL" models/silero_vad.onnx "$SILERO_VAD_SHA256" "the Silero VAD model"
 fi
 
 # 6. Build whisper.cpp and download model (fallback engine, used when stt_engine is "whisper")
@@ -151,10 +184,18 @@ fi
     cd whisper.cpp
     cmake -B build -DCMAKE_BUILD_TYPE=Release
     cmake --build build --config Release -j"$(nproc)"
-    if [ ! -f "models/ggml-base.en.bin" ]; then
-        bash models/download-ggml-model.sh base.en
-    fi
 )
+# Downloaded here rather than by whisper.cpp's own script, which neither pins
+# a revision nor checks what it got
+if [ -f "whisper.cpp/models/ggml-base.en.bin" ] && \
+   ! echo "$WHISPER_MODEL_SHA256  whisper.cpp/models/ggml-base.en.bin" | sha256sum -c --quiet; then
+    echo -e "${YELLOW}whisper.cpp/models/ggml-base.en.bin fails its checksum; downloading it again...${NC}"
+    rm -f whisper.cpp/models/ggml-base.en.bin
+fi
+if [ ! -f "whisper.cpp/models/ggml-base.en.bin" ]; then
+    download_verified "$WHISPER_MODEL_URL" whisper.cpp/models/ggml-base.en.bin "$WHISPER_MODEL_SHA256" \
+        "the whisper base.en model"
+fi
 if [ ! -x "whisper.cpp/build/bin/whisper-cli" ]; then
     echo -e "${RED}❌ whisper.cpp build failed: whisper.cpp/build/bin/whisper-cli not found.${NC}"
     exit 1
@@ -164,17 +205,7 @@ fi
 echo -e "${YELLOW}[7/10] Checking Wake Word Model...${NC}"
 if [ ! -f "wakeword.onnx" ]; then
     echo -e "${YELLOW}Downloading default 'Hey Jarvis' wake word...${NC}"
-    if ! curl -fL -o wakeword.onnx.tmp "$WAKEWORD_URL"; then
-        rm -f wakeword.onnx.tmp
-        echo -e "${RED}❌ Failed to download wake word model from $WAKEWORD_URL${NC}"
-        exit 1
-    fi
-    if ! echo "$WAKEWORD_SHA256  wakeword.onnx.tmp" | sha256sum -c --quiet; then
-        rm -f wakeword.onnx.tmp
-        echo -e "${RED}❌ Wake word model checksum mismatch; refusing to install it.${NC}"
-        exit 1
-    fi
-    mv wakeword.onnx.tmp wakeword.onnx
+    download_verified "$WAKEWORD_URL" wakeword.onnx "$WAKEWORD_SHA256" "the wake word model"
 fi
 
 # 8. Launch script
@@ -193,8 +224,16 @@ done
 
 # 10. Desktop autostart entry (starts the agent with the desktop session)
 echo -e "${YELLOW}[10/10] Installing desktop autostart entry...${NC}"
+# The path goes into a sed replacement and a quoted Exec= line, where these
+# characters would need escaping; refuse them rather than write a broken entry
+UNSAFE_PATH_CHARS='["`$\\|&]'
+if [[ "$PWD" =~ $UNSAFE_PATH_CHARS ]]; then
+    echo -e "${RED}❌ The repo path contains one of \" \` \$ \\ | &: $PWD${NC}"
+    echo -e "${RED}   Move it to a plainer path to install the autostart entry.${NC}"
+    exit 1
+fi
 mkdir -p "$HOME/.config/autostart"
-sed "s|__BASE_DIR__|$(pwd)|g" be-more-agent.desktop > "$HOME/.config/autostart/be-more-agent.desktop"
+sed "s|__BASE_DIR__|$PWD|g" be-more-agent.desktop > "$HOME/.config/autostart/be-more-agent.desktop"
 
 if [ ! -f .env ]; then
     echo -e "${YELLOW}Next: create your API key file and keep it private:${NC}"

@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # tkinter and PortAudio for importing agent.py in tests/test_turn.py. The
+      # project forbids uv-managed Pythons (no Tk), so this is the runner's
+      # system python3 with the matching python3-tk.
+      - name: Install system libraries
+        run: sudo apt-get update && sudo apt-get install -y python3-tk libportaudio2
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          version: "0.11.32"
+
+      - name: Lint
+        run: uvx ruff@0.17.1 check agent.py bmo tests
+
+      - name: Syntax check
+        run: python3 -m py_compile agent.py bmo/*.py
+
+      - name: Tests
+        run: uv run --locked --group dev pytest -q
